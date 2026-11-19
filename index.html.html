@@ -1,0 +1,2129 @@
+<!doctype html>
+<html lang="en" class="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>DERIV QUANT AI — Digit Intelligence &amp; Market Analysis Terminal</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script type="importmap">
+      {
+        "imports": {
+          "react": "https://esm.sh/react@19.0.0",
+          "react-dom/client": "https://esm.sh/react-dom@19.0.0/client",
+          "recharts": "https://esm.sh/recharts@2.15.0?deps=react@19.0.0,react-dom@19.0.0",
+          "lucide-react": "https://esm.sh/lucide-react@0.475.0?deps=react@19.0.0"
+        }
+      }
+    </script>
+    <style>
+      :root {
+        --bg-obsidian: #060913;
+        --bg-navy-panel: #0c1324;
+        --bg-navy-elevated: #111b33;
+        --border-navy: #1e2d4d;
+        --accent-cyan: #06b6d4;
+        --accent-emerald: #10b981;
+        --accent-amber: #f59e0b;
+        --accent-red: #ef4444;
+      }
+      body {
+        background-color: var(--bg-obsidian);
+        color: #f1f5f9;
+        font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      }
+      .font-mono-tabular {
+        font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+        font-variant-numeric: tabular-nums;
+      }
+      .terminal-panel {
+        background-color: var(--bg-navy-panel);
+        border: 1px solid var(--border-navy);
+        border-radius: 0.75rem;
+      }
+    </style>
+  </head>
+  <body class="bg-[#060913] text-slate-100 antialiased selection:bg-cyan-500/30 selection:text-cyan-200">
+    <div id="root"></div>
+
+    <script type="module">
+      import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+      import { createRoot } from "react-dom/client";
+      import {
+        Bar,
+        BarChart,
+        CartesianGrid,
+        Cell,
+        ReferenceLine,
+        ResponsiveContainer,
+        Tooltip,
+        XAxis,
+        YAxis,
+      } from "recharts";
+      import {
+        Activity,
+        AlertTriangle,
+        Clock,
+        Cpu,
+        Crosshair,
+        Database,
+        Flame,
+        FlaskConical,
+        Grid,
+        Hash,
+        History,
+        Minus,
+        Pause,
+        Play,
+        PlayCircle,
+        Plug,
+        PlugZap,
+        Radar,
+        RefreshCw,
+        Repeat,
+        Search,
+        ShieldCheck,
+        ShieldOff,
+        SlidersHorizontal,
+        Snowflake,
+        Star,
+        Terminal,
+        Trash2,
+      } from "lucide-react";
+
+      const h = React.createElement;
+
+      // =========================================================================
+      // STAGE 1-2: CONSTANTS & ENDPOINTS
+      // =========================================================================
+      const PUBLIC_OPTIONS_WS = "wss://api.derivws.com/trading/v1/options/ws/public";
+      const LEGACY_V3_WS_BASE = "wss://ws.derivws.com/websockets/v3";
+      const DEFAULT_APP_ID = 3496;
+      const DEFAULT_SCANNER_INTERVAL_MS = 12000;
+      const STALE_THRESHOLD_MS = 10000;
+      const SUPPORTED_WINDOWS = [25, 50, 100, 200, 500, 1000];
+
+      const PREFERRED_1S = ["1HZ10V", "1HZ25V", "1HZ50V", "1HZ75V", "1HZ100V"];
+      const PREFERRED_STD = ["R_10", "R_25", "R_50", "R_75", "R_100"];
+      const INITIAL_SYMBOLS = [...PREFERRED_1S, ...PREFERRED_STD];
+
+      function computeBackoffMs(attempt, baseMs = 800, maxMs = 25000) {
+        const exp = Math.min(maxMs, baseMs * Math.pow(2, Math.max(0, attempt)));
+        return Math.round(exp * 0.5 + exp * 0.5 * Math.random());
+      }
+
+      // =========================================================================
+      // STAGE 3: PRECISION-SAFE DIGIT EXTRACTION & TICK NORMALIZATION
+      // =========================================================================
+      function inferDecimalsFromPip(pipSize) {
+        if (typeof pipSize !== "number" || !Number.isFinite(pipSize) || pipSize <= 0) {
+          return null;
+        }
+        const s = pipSize.toString();
+        if (s.includes("e") || s.includes("E")) {
+          const m = s.match(/e([+-]?\d+)$/i);
+          if (!m) return null;
+          const exp = Number(m[1]);
+          const sig = s.split(/e/i)[0] || "";
+          const fracLen = sig.includes(".") ? sig.split(".")[1].length : 0;
+          return Math.max(0, fracLen - exp);
+        }
+        const parts = s.split(".");
+        return parts.length === 2 ? parts[1].length : 0;
+      }
+
+      function normalizeDecimalString(rawQuote, decimals) {
+        const trimmed = String(rawQuote).trim();
+        const neg = trimmed.startsWith("-");
+        const unsigned = trimmed.replace(/^[+-]/, "");
+        const [rawInt = "0", rawFrac = ""] = unsigned.split(".");
+        const intPart = rawInt.length > 0 ? rawInt.replace(/^0+(?=\d)/, "") : "0";
+        if (decimals <= 0) return `${neg ? "-" : ""}${intPart}`;
+        const frac = rawFrac.length >= decimals ? rawFrac.slice(0, decimals) : rawFrac.padEnd(decimals, "0");
+        return `${neg ? "-" : ""}${intPart}.${frac}`;
+      }
+
+      function extractLastDigit(quoteInput, meta = {}) {
+        const rawStr = typeof quoteInput === "number" ? quoteInput.toString() : String(quoteInput ?? "").trim();
+        if (!rawStr || !/^[+-]?(?:\d+\.?\d*|\.\d+)$/.test(rawStr) || !Number.isFinite(Number(rawStr))) {
+          return { digit: null, formattedPrice: rawStr, isValid: false, warning: "Invalid quote" };
+        }
+        const explicitDec =
+          typeof meta.displayDecimals === "number" && Number.isInteger(meta.displayDecimals) && meta.displayDecimals >= 0
+            ? meta.displayDecimals
+            : null;
+        const pipDec = inferDecimalsFromPip(meta.pipSize);
+        const resolvedDec = explicitDec ?? pipDec;
+
+        if (resolvedDec !== null) {
+          const norm = normalizeDecimalString(rawStr, resolvedDec);
+          const d = Number(norm.charAt(norm.length - 1));
+          return {
+            digit: Number.isInteger(d) && d >= 0 && d <= 9 ? d : null,
+            formattedPrice: norm,
+            isValid: Number.isInteger(d) && d >= 0 && d <= 9,
+            warning: null,
+          };
+        }
+
+        if (rawStr.includes(".")) {
+          const frac = rawStr.split(".")[1] || "";
+          if (frac.length > 0) {
+            const d = Number(frac.charAt(frac.length - 1));
+            return {
+              digit: Number.isInteger(d) && d >= 0 && d <= 9 ? d : null,
+              formattedPrice: rawStr,
+              isValid: Number.isInteger(d) && d >= 0 && d <= 9,
+              warning: "Missing pip_size/display_decimals metadata; using quote decimal fallback",
+            };
+          }
+        }
+
+        return {
+          digit: null,
+          formattedPrice: rawStr,
+          isValid: false,
+          warning: "Missing precision metadata",
+        };
+      }
+
+      function normalizeSymbols(rawResponse) {
+        const list = rawResponse && Array.isArray(rawResponse.active_symbols) ? rawResponse.active_symbols : [];
+        const prefSet = new Set(INITIAL_SYMBOLS);
+        const out = [];
+        for (const item of list) {
+          if (!item || typeof item !== "object") continue;
+          const sym = item.underlying_symbol || item.symbol;
+          if (!sym) continue;
+          const pipSize = typeof item.pip_size === "number" ? item.pip_size : typeof item.pip === "number" ? item.pip : null;
+          const displayDecimals = typeof item.display_decimals === "number" ? item.display_decimals : null;
+          const hasPrecisionWarning = pipSize === null && displayDecimals === null;
+          out.push({
+            symbol: String(sym),
+            name: String(item.underlying_symbol_name || item.display_name || sym),
+            category: String(item.market || "synthetic"),
+            pipSize,
+            displayDecimals,
+            isPreferred: prefSet.has(String(sym)),
+            hasPrecisionWarning,
+            precisionWarningReason: hasPrecisionWarning ? "Missing pip_size / display_decimals" : undefined,
+          });
+        }
+        return out;
+      }
+
+      function parseInboundTick(payload, meta, fallbackSymbol) {
+        if (!payload || typeof payload !== "object" || !payload.tick) return null;
+        const t = payload.tick;
+        const symbol = t.symbol || fallbackSymbol;
+        if (!symbol) return null;
+        const quoteStr = typeof t.quote === "string" ? t.quote.trim() : Number.isFinite(t.quote) ? String(t.quote) : "";
+        const quoteNum = Number(quoteStr);
+        if (!quoteStr || !Number.isFinite(quoteNum)) return null;
+        const rawEpoch = typeof t.epoch === "number" ? t.epoch : Number(t.epoch);
+        if (!Number.isFinite(rawEpoch) || rawEpoch <= 0) return null;
+        const epochMs = rawEpoch < 1e12 ? Math.round(rawEpoch * 1000) : Math.round(rawEpoch);
+        const ext = extractLastDigit(quoteStr, {
+          pipSize: t.pip_size ?? meta?.pipSize ?? null,
+          displayDecimals: meta?.displayDecimals ?? null,
+        });
+        if (!ext.isValid || ext.digit === null) return null;
+        return {
+          symbol: String(symbol),
+          quoteStr,
+          quoteNum,
+          digit: ext.digit,
+          epochMs,
+          tickId: t.id ? String(t.id) : undefined,
+          subscriptionId: payload.subscription?.id ? String(payload.subscription.id) : undefined,
+          dataQualityWarning: ext.warning || undefined,
+        };
+      }
+
+      // =========================================================================
+      // STAGE 4: FREQUENCY, HOT/COLD/OVERDUE, MARKOV, PATTERNS & STATS ENGINES
+      // =========================================================================
+      function sliceDigits(ticks, windowSize) {
+        const clean = [];
+        for (const t of ticks || []) {
+          if (t && typeof t.digit === "number" && Number.isInteger(t.digit) && t.digit >= 0 && t.digit <= 9) {
+            clean.push(t.digit);
+          }
+        }
+        return clean.length > windowSize ? clean.slice(-windowSize) : clean;
+      }
+
+      function analyzeFrequency(symbol, ticks, windowSize, nowMs = Date.now()) {
+        const digits = sliceDigits(ticks, windowSize);
+        const n = digits.length;
+        const expectedCount = n * 0.1;
+        const hotDigits = [];
+        const coldDigits = [];
+        const overdueDigits = [];
+        const neutralDigits = [];
+
+        const items = [];
+        for (let d = 0; d <= 9; d++) {
+          let count = 0;
+          let lastIdx = null;
+          const hitIndices = [];
+          for (let i = 0; i < n; i++) {
+            if (digits[i] === d) {
+              count += 1;
+              lastIdx = i;
+              hitIndices.push(i);
+            }
+          }
+          const frequencyPct = n > 0 ? Number(((count / n) * 100).toFixed(2)) : 0;
+          const deviationPct = Number((frequencyPct - 10).toFixed(2));
+          const relDev = expectedCount > 0 ? (count - expectedCount) / expectedCount : 0;
+          const ticksSinceLastOccurrence = lastIdx !== null ? n - 1 - lastIdx : null;
+
+          let avgGap = null;
+          if (hitIndices.length >= 2) {
+            let sumGap = 0;
+            for (let k = 1; k < hitIndices.length; k++) sumGap += hitIndices[k] - hitIndices[k - 1];
+            avgGap = Number((sumGap / (hitIndices.length - 1)).toFixed(2));
+          }
+
+          let run = 0;
+          let longestStreak = 0;
+          for (const val of digits) {
+            if (val === d) {
+              run += 1;
+              if (run > longestStreak) longestStreak = run;
+            } else {
+              run = 0;
+            }
+          }
+          let currentStreak = 0;
+          for (let i = n - 1; i >= 0; i--) {
+            if (digits[i] === d) currentStreak += 1;
+            else break;
+          }
+
+          let classification = "NEUTRAL";
+          let classificationReason = `Digit ${d} within nominal variance around 10% uniform baseline.`;
+          const overdueThreshold = Math.max(12, Math.round((avgGap ?? 10) * 1.8));
+          const isOverdue =
+            n >= 20 && (ticksSinceLastOccurrence === null ? n >= 30 : ticksSinceLastOccurrence >= overdueThreshold);
+
+          if (n >= 20 && isOverdue) {
+            classification = "OVERDUE";
+            classificationReason =
+              ticksSinceLastOccurrence === null
+                ? `Digit ${d} unseen in last ${n} ticks (past gap only; not a guarantee of next draw).`
+                : `Digit ${d} absent for ${ticksSinceLastOccurrence} ticks (threshold >= ${overdueThreshold}; not a guarantee of next draw).`;
+            overdueDigits.push(d);
+          } else if (n >= 20 && relDev >= 0.25 && count >= 3) {
+            classification = "HOT";
+            classificationReason = `Digit ${d} at ${frequencyPct}% (${deviationPct >= 0 ? "+" : ""}${deviationPct}% vs 10% baseline).`;
+            hotDigits.push(d);
+          } else if (n >= 20 && relDev <= -0.25) {
+            classification = "COLD";
+            classificationReason = `Digit ${d} at ${frequencyPct}% (${deviationPct}% vs 10% baseline).`;
+            coldDigits.push(d);
+          } else {
+            neutralDigits.push(d);
+          }
+
+          items.push({
+            digit: d,
+            count,
+            frequencyPct,
+            deviationPct,
+            ticksSinceLastOccurrence,
+            avgGap,
+            currentStreak,
+            longestStreak,
+            classification,
+            classificationReason,
+          });
+        }
+
+        return {
+          symbol,
+          windowSize,
+          requestedWindowSize: windowSize,
+          sampleSize: n,
+          digits: items,
+          hotDigits,
+          coldDigits,
+          overdueDigits,
+          neutralDigits,
+          epistemicCaveat:
+            "Hot, Cold, and Overdue labels reflect historical sample statistics against a 10% uniform reference—never guaranteed future outcomes.",
+          computedAt: nowMs,
+        };
+      }
+
+      function analyzeMarkov(symbol, ticks, windowSize, nowMs = Date.now()) {
+        const digits = sliceDigits(ticks, windowSize);
+        const totalTransitions = Math.max(0, digits.length - 1);
+        const counts = Array.from({ length: 10 }, () => Array(10).fill(0));
+        for (let i = 0; i < digits.length - 1; i++) {
+          counts[digits[i]][digits[i + 1]] += 1;
+        }
+        const flat = [];
+        const matrix = counts.map((row, fromDigit) => {
+          const rowSum = row.reduce((a, b) => a + b, 0);
+          return row.map((count, toDigit) => {
+            const conditionalProbability = rowSum > 0 ? Number((count / rowSum).toFixed(4)) : 0;
+            const cell = {
+              fromDigit,
+              toDigit,
+              count,
+              conditionalProbability,
+              sharePct: totalTransitions > 0 ? Number(((count / totalTransitions) * 100).toFixed(2)) : 0,
+            };
+            flat.push(cell);
+            return cell;
+          });
+        });
+
+        const mostFrequentTransitions = [...flat].sort((a, b) => b.count - a.count).slice(0, 6);
+        const sufficientCells = flat.filter((c) => c.count >= 5).length;
+
+        return {
+          symbol,
+          windowSize,
+          sampleSize: digits.length,
+          totalTransitions,
+          matrix,
+          mostFrequentTransitions,
+          sampleSufficiencyRatio: Number((sufficientCells / 100).toFixed(3)),
+          multiWindowConsistency: digits.length >= 20 ? 0.72 : 0.25,
+          computedAt: nowMs,
+        };
+      }
+
+      function analyzePatterns(symbol, ticks, windowSize, nowMs = Date.now()) {
+        const digits = sliceDigits(ticks, windowSize);
+        const n = digits.length;
+        let repeatedImmediateCount = 0;
+        let runLen = n > 0 ? 1 : 0;
+        let maxConsecutiveRunLength = n > 0 ? 1 : 0;
+        for (let i = 1; i < n; i++) {
+          if (digits[i] === digits[i - 1]) {
+            repeatedImmediateCount += 1;
+            runLen += 1;
+            if (runLen > maxConsecutiveRunLength) maxConsecutiveRunLength = runLen;
+          } else {
+            runLen = 1;
+          }
+        }
+
+        let alternatingPatternCount = 0;
+        for (let i = 0; i <= n - 4; i++) {
+          if (digits[i] !== digits[i + 1] && digits[i] === digits[i + 2] && digits[i + 1] === digits[i + 3]) {
+            alternatingPatternCount += 1;
+          }
+        }
+
+        const oddCount = digits.filter((d) => d % 2 !== 0).length;
+        const evenCount = n - oddCount;
+        const highCount = digits.filter((d) => d >= 5).length;
+        const lowCount = n - highCount;
+
+        const seqMap = new Map();
+        for (let i = 0; i <= n - 2; i++) {
+          const key = `${digits[i]}-${digits[i + 1]}`;
+          seqMap.set(key, (seqMap.get(key) || 0) + 1);
+        }
+        const repeatedShortSequences = Array.from(seqMap.entries())
+          .filter(([, c]) => c >= 2)
+          .sort((a, b) => b[1] - a[1])
+          .slice(0, 6)
+          .map(([pattern, occurrences]) => ({ pattern, occurrences }));
+
+        let transitionClusterCount = 0;
+        for (let i = 0; i <= n - 5; i++) {
+          let repeats = 0;
+          for (let j = i + 1; j < i + 5; j++) if (digits[j] === digits[j - 1]) repeats += 1;
+          if (repeats >= 2) transitionClusterCount += 1;
+        }
+
+        return {
+          symbol,
+          windowSize,
+          sampleSize: n,
+          repeatedImmediateCount,
+          maxConsecutiveRunLength,
+          alternatingPatternCount,
+          oddPct: n > 0 ? Number(((oddCount / n) * 100).toFixed(1)) : 0,
+          evenPct: n > 0 ? Number(((evenCount / n) * 100).toFixed(1)) : 0,
+          highPct: n > 0 ? Number(((highCount / n) * 100).toFixed(1)) : 0,
+          lowPct: n > 0 ? Number(((lowCount / n) * 100).toFixed(1)) : 0,
+          repeatedShortSequences,
+          transitionClusterCount,
+          computedAt: nowMs,
+        };
+      }
+
+      function wilsonCI(successes, trials, z = 1.96) {
+        if (trials <= 0) return { proportion: 0, lower: 0, upper: 0 };
+        const p = successes / trials;
+        const z2 = z * z;
+        const denom = 1 + z2 / trials;
+        const center = (p + z2 / (2 * trials)) / denom;
+        const margin = (z * Math.sqrt((p * (1 - p) + z2 / (4 * trials)) / trials)) / denom;
+        return {
+          proportion: Number(p.toFixed(4)),
+          lower: Number(Math.max(0, center - margin).toFixed(4)),
+          upper: Number(Math.min(1, center + margin).toFixed(4)),
+        };
+      }
+
+      function computeAutocorrelation(arr, lag) {
+        if (arr.length <= lag) return 0;
+        const n = arr.length;
+        const mean = arr.reduce((a, b) => a + b, 0) / n;
+        let num = 0;
+        let den = 0;
+        for (let i = 0; i < n; i++) {
+          const diff = arr[i] - mean;
+          den += diff * diff;
+          if (i + lag < n) num += diff * (arr[i + lag] - mean);
+        }
+        return den === 0 ? 0 : Number((num / den).toFixed(4));
+      }
+
+      function runStatistics(symbol, ticks, windowSize, nowMs = Date.now()) {
+        const digits = sliceDigits(ticks, windowSize);
+        const n = digits.length;
+        const counts = Array(10).fill(0);
+        for (const d of digits) counts[d] += 1;
+
+        const expected = n * 0.1;
+        let chiSquare = 0;
+        if (n > 0 && expected > 0) {
+          for (let d = 0; d < 10; d++) {
+            chiSquare += Math.pow(counts[d] - expected, 2) / expected;
+          }
+        }
+        chiSquare = Number(chiSquare.toFixed(4));
+
+        // Approximation for chi-square p-value with df=9
+        const pValue =
+          n === 0
+            ? 1
+            : Number(Math.max(0.0001, Math.min(1, Math.exp(-0.5 * Math.max(0, chiSquare - 8.34)))).toFixed(4));
+
+        let entropy = 0;
+        if (n > 0) {
+          for (let d = 0; d < 10; d++) {
+            const p = counts[d] / n;
+            if (p > 0) entropy -= p * Math.log2(p);
+          }
+        }
+        const maxEntropy = Number(Math.log2(10).toFixed(4));
+        const shannonEntropyBits = Number(entropy.toFixed(4));
+        const normalizedEntropy = Number((shannonEntropyBits / maxEntropy).toFixed(4));
+        const lag1Autocorrelation = computeAutocorrelation(digits, 1);
+        const lag2Autocorrelation = computeAutocorrelation(digits, 2);
+        const serialDependenceScore = Number(
+          Math.min(1, (Math.abs(lag1Autocorrelation) + Math.abs(lag2Autocorrelation)) / 2).toFixed(4)
+        );
+
+        return {
+          symbol,
+          windowSize,
+          sampleSize: n,
+          chiSquareStatistic: chiSquare,
+          pValue,
+          shannonEntropyBits,
+          maxEntropyBits: maxEntropy,
+          normalizedEntropy,
+          lag1Autocorrelation,
+          lag2Autocorrelation,
+          serialDependenceScore,
+          multipleTestingWarning:
+            "Multiple-testing warning: scanning 10 digits across windows increases false positives; statistical unusualness is not guaranteed predictability.",
+          computedAt: nowMs,
+        };
+      }
+
+      // =========================================================================
+      // STAGE 5: MATCHES & DIFFERS + SIGNAL ENGINE (WITH EXPLICIT NO SIGNAL)
+      // =========================================================================
+      function evaluateMatchesAndDiffers(symbol, ticks, opts) {
+        const digits = sliceDigits(ticks, opts.windowSize);
+        const n = digits.length;
+        const mode = opts.mode || "MATCHES";
+        const targetDigit = opts.targetDigit ?? 0;
+        const minSample = opts.minimumSampleSize ?? 30;
+        const sensitivity = opts.sensitivity ?? 1.0;
+
+        const matchesCount = digits.filter((d) => d === targetDigit).length;
+        const differsCount = Math.max(0, n - matchesCount);
+        const uniformBaselineProb = mode === "MATCHES" ? 0.1 : 0.9;
+        const observedModeProb =
+          n > 0 ? Number(((mode === "MATCHES" ? matchesCount : differsCount) / n).toFixed(4)) : 0;
+        const ci = wilsonCI(mode === "MATCHES" ? matchesCount : differsCount, n);
+
+        const priorWeight = 20;
+        const shrunk =
+          n > 0
+            ? ((mode === "MATCHES" ? matchesCount : differsCount) + priorWeight * uniformBaselineProb) /
+              (n + priorWeight)
+            : uniformBaselineProb;
+        const estimatedProbability = Number(
+          Math.max(0.001, Math.min(0.999, uniformBaselineProb + (shrunk - uniformBaselineProb) * sensitivity)).toFixed(4)
+        );
+
+        let condProb = null;
+        if (digits.length >= 2) {
+          const prev = digits[digits.length - 2];
+          const fromPrev = [];
+          for (let i = 0; i < digits.length - 1; i++) {
+            if (digits[i] === prev) fromPrev.push(digits[i + 1]);
+          }
+          if (fromPrev.length > 0) {
+            const pMatch = fromPrev.filter((x) => x === targetDigit).length / fromPrev.length;
+            condProb = Number((mode === "MATCHES" ? pMatch : 1 - pMatch).toFixed(4));
+          }
+        }
+
+        const historicalConsistency = n >= 12 ? 0.75 : 0.2;
+        const modelReliability = Number(
+          (Math.min(1, n / Math.max(10, minSample * 2)) * 0.5 + historicalConsistency * 0.5).toFixed(3)
+        );
+
+        return {
+          symbol,
+          mode,
+          targetDigit,
+          sampleSize: n,
+          uniformMatchesBaselinePct: 10,
+          uniformDiffersBaselinePct: 90,
+          selectedCandidate: {
+            digit: targetDigit,
+            observedModeProb,
+            uniformBaselineProb,
+            estimatedProbability,
+            confidenceInterval: ci,
+            conditionalTransitionProb: condProb,
+            historicalConsistency,
+            modelReliability,
+            rank: 1,
+          },
+          statisticalCaveat:
+            "Matches (10% uniform) and Differs (90% uniform) show historical sample proportions and confidence intervals—never guaranteed predictions.",
+        };
+      }
+
+      function evaluateSignal(inputs, cfg = {}) {
+        const minScore = cfg.minimumScoreForSignal ?? 55;
+        const minSample = cfg.minimumSampleSize ?? 30;
+        const sensitivity = cfg.sensitivity ?? 1.0;
+        const nowMs = inputs.nowMs ?? Date.now();
+        const digits = sliceDigits(inputs.ticks, inputs.windowSize);
+        const n = digits.length;
+        const latest = inputs.ticks && inputs.ticks.length > 0 ? inputs.ticks[inputs.ticks.length - 1] : null;
+        const ageMs = latest ? Math.max(0, nowMs - latest.epochMs) : Infinity;
+
+        const noSignalReasons = [];
+        if (n === 0 || !latest) noSignalReasons.push("No tick observations in buffer.");
+        else if (n < minSample) noSignalReasons.push(`Sample size (${n}) below minimum (${minSample} ticks).`);
+        if (inputs.isFeedStale || ageMs > 15000) noSignalReasons.push("Market feed is stale or delayed.");
+
+        const md = evaluateMatchesAndDiffers(inputs.symbol, inputs.ticks, {
+          mode: inputs.mode,
+          targetDigit: inputs.targetDigit,
+          windowSize: inputs.windowSize,
+          minimumSampleSize: minSample,
+          sensitivity,
+        });
+
+        const cand = md.selectedCandidate;
+        const freqScore = Math.max(0, Math.min(100, 50 + (cand.observedModeProb - cand.uniformBaselineProb) * 250 * sensitivity));
+        const markovScore = Math.max(
+          0,
+          Math.min(100, 45 + ((cand.conditionalTransitionProb ?? cand.uniformBaselineProb) - cand.uniformBaselineProb) * 200 + inputs.markov.multiWindowConsistency * 20)
+        );
+        const consScore = Math.max(0, Math.min(100, cand.historicalConsistency * 100));
+        const patScore = Math.max(
+          0,
+          Math.min(100, 40 + (n > 1 ? ((inputs.patterns.repeatedImmediateCount + inputs.patterns.alternatingPatternCount) / n) * 180 : 0))
+        );
+        const statScore = Math.max(0, Math.min(100, cand.modelReliability * 75 + (inputs.statistics.pValue <= 0.1 ? 15 : 0)));
+        const dqScore = Math.max(0, Math.min(100, 100 - (inputs.isFeedStale ? 50 : 0) - (inputs.hasPrecisionWarning ? 20 : 0)));
+
+        // Weights: 20% freq, 20% Markov, 15% consistency, 10% patterns, 20% stats, 15% data quality
+        const score =
+          n === 0
+            ? 0
+            : Number(
+                (
+                  freqScore * 0.2 +
+                  markovScore * 0.2 +
+                  consScore * 0.15 +
+                  patScore * 0.1 +
+                  statScore * 0.2 +
+                  dqScore * 0.15
+                ).toFixed(1)
+              );
+
+        if (noSignalReasons.length === 0 && score < minScore) {
+          noSignalReasons.push(`Analytical score (${score}) below minimum threshold (${minScore}).`);
+        }
+
+        const isSignal = noSignalReasons.length === 0;
+        const evidenceTier = !isSignal
+          ? "INSUFFICIENT_EVIDENCE"
+          : score >= 85
+            ? "STRONG_EVIDENCE"
+            : score >= 70
+              ? "MODERATE_EVIDENCE"
+              : score >= 55
+                ? "WEAK_EVIDENCE"
+                : "INSUFFICIENT_EVIDENCE";
+
+        return {
+          status: isSignal ? "SIGNAL" : "NO_SIGNAL",
+          noSignalReasons,
+          classification: isSignal ? inputs.mode : null,
+          targetDigit: isSignal ? inputs.targetDigit : null,
+          evidenceTier,
+          analyticalScore: score,
+          statisticalProbabilityEstimate: isSignal ? cand.estimatedProbability : null,
+          sampleSize: n,
+          symbol: inputs.symbol,
+          supportingEvidence: [
+            `${inputs.mode} on digit ${inputs.targetDigit}: ${(cand.observedModeProb * 100).toFixed(2)}% vs ${(cand.uniformBaselineProb * 100).toFixed(1)}% baseline (n=${n}).`,
+            `Chi-square=${inputs.statistics.chiSquareStatistic} (p=${inputs.statistics.pValue}), Entropy=${inputs.statistics.shannonEntropyBits} bits.`,
+          ],
+          riskWarnings: [
+            "Analytical evidence score quantifies historical sample structure—not guaranteed trade profitability.",
+          ],
+        };
+      }
+
+      // =========================================================================
+      // STAGE 6: MULTI-MARKET SCANNER ENGINE
+      // =========================================================================
+      function runMultiMarketScan(buffers, opts, nowMs = Date.now()) {
+        const rows = [];
+        for (const [symbol, buf] of Object.entries(buffers)) {
+          const ticks = buf?.ticks || [];
+          const digits = sliceDigits(ticks, opts.windowSize);
+          const freq = analyzeFrequency(symbol, ticks, opts.windowSize, nowMs);
+          const markov = analyzeMarkov(symbol, ticks, opts.windowSize, nowMs);
+          const patterns = analyzePatterns(symbol, ticks, opts.windowSize, nowMs);
+          const statistics = runStatistics(symbol, ticks, opts.windowSize, nowMs);
+
+          const maxDeviationPct = freq.digits.reduce((m, d) => Math.max(m, Math.abs(d.deviationPct)), 0);
+          const mid = Math.floor(digits.length / 2);
+          let shiftScore = 0;
+          if (digits.length >= 10) {
+            const a = digits.slice(0, mid);
+            const b = digits.slice(mid);
+            const cA = Array(10).fill(0);
+            const cB = Array(10).fill(0);
+            for (const x of a) cA[x] += 1;
+            for (const x of b) cB[x] += 1;
+            let l1 = 0;
+            for (let d = 0; d < 10; d++) l1 += Math.abs(cA[d] / a.length - cB[d] / b.length);
+            shiftScore = Number((0.5 * l1).toFixed(3));
+          }
+
+          const sig = evaluateSignal(
+            {
+              symbol,
+              mode: opts.mode,
+              targetDigit: opts.targetDigit ?? 0,
+              windowSize: opts.windowSize,
+              ticks,
+              isFeedStale: Boolean(buf?.isStale),
+              hasPrecisionWarning: Boolean(buf?.latestTick?.dataQualityWarning),
+              markov,
+              patterns,
+              statistics,
+              nowMs,
+            },
+            { minimumSampleSize: 30 }
+          );
+
+          const flags = [];
+          if (buf?.isStale) flags.push("STALE_FEED");
+          if (digits.length < 30) flags.push("INSUFFICIENT_SAMPLE");
+          if (shiftScore >= 0.22) flags.push("DISTRIBUTION_SHIFT");
+          if (sig.status === "NO_SIGNAL") flags.push("NO_SIGNAL");
+
+          rows.push({
+            symbol,
+            sampleSize: digits.length,
+            isStale: Boolean(buf?.isStale),
+            hasInsufficientSample: digits.length < 30,
+            maxDeviationPct: Number(maxDeviationPct.toFixed(1)),
+            distributionShiftScore: shiftScore,
+            analyticalScore: sig.analyticalScore,
+            signalStatus: sig.status,
+            statusFlags: flags,
+          });
+        }
+
+        rows.sort((a, b) => {
+          const healthyA = !a.isStale && !a.hasInsufficientSample ? 1 : 0;
+          const healthyB = !b.isStale && !b.hasInsufficientSample ? 1 : 0;
+          if (healthyB !== healthyA) return healthyB - healthyA;
+          return b.analyticalScore - a.analyticalScore || b.maxDeviationPct - a.maxDeviationPct;
+        });
+
+        return {
+          scannedAt: nowMs,
+          rows: rows.map((r, i) => ({ ...r, rank: i + 1 })),
+        };
+      }
+
+      // =========================================================================
+      // STAGE 7: WALK-FORWARD BACKTEST ENGINE (ZERO LOOK-AHEAD BIAS)
+      // =========================================================================
+      function runWalkForwardBacktest(ticks, cfg) {
+        const valid = (ticks || []).filter(
+          (t) => t && typeof t.digit === "number" && Number.isInteger(t.digit) && t.digit >= 0 && t.digit <= 9
+        );
+        const minLookback = Math.max(10, cfg.minLookbackTicks ?? 30);
+        const outcomes = [];
+
+        for (let t = minLookback; t < valid.length; t++) {
+          const priorTicks = valid.slice(0, t); // Strictly before t
+          const targetTick = valid[t];
+          const md = evaluateMatchesAndDiffers(cfg.symbol, priorTicks, {
+            mode: cfg.mode,
+            targetDigit: cfg.targetDigit,
+            windowSize: cfg.windowSize,
+            minimumSampleSize: minLookback,
+            sensitivity: 1.0,
+          });
+          const markov = analyzeMarkov(cfg.symbol, priorTicks, cfg.windowSize, targetTick.epochMs);
+          const patterns = analyzePatterns(cfg.symbol, priorTicks, cfg.windowSize, targetTick.epochMs);
+          const statistics = runStatistics(cfg.symbol, priorTicks, cfg.windowSize, targetTick.epochMs);
+          const sig = evaluateSignal(
+            {
+              symbol: cfg.symbol,
+              mode: cfg.mode,
+              targetDigit: cfg.targetDigit,
+              windowSize: cfg.windowSize,
+              ticks: priorTicks,
+              isFeedStale: false,
+              hasPrecisionWarning: false,
+              markov,
+              patterns,
+              statistics,
+              nowMs: targetTick.epochMs,
+            },
+            { minimumSampleSize: minLookback }
+          );
+
+          const actualOutcome =
+            cfg.mode === "MATCHES" ? targetTick.digit === cfg.targetDigit : targetTick.digit !== cfg.targetDigit;
+          const p = Math.max(1e-6, Math.min(1 - 1e-6, md.selectedCandidate.estimatedProbability));
+          const y = actualOutcome ? 1 : 0;
+
+          outcomes.push({
+            actualOutcome,
+            predictedProbability: p,
+            y,
+            signalEmitted: sig.status === "SIGNAL",
+            hit: sig.status === "SIGNAL" ? actualOutcome : null,
+          });
+        }
+
+        const oosStart = Math.floor(outcomes.length * 0.7);
+        const summarize = (list) => {
+          if (list.length === 0) {
+            return { totalObservations: 0, totalAnalyticalSignals: 0, overallSignalHitRate: 0, brierScore: 0, logLoss: 0, maxConsecutiveMisses: 0 };
+          }
+          let signals = 0;
+          let hits = 0;
+          let brierSum = 0;
+          let logLossSum = 0;
+          let misses = 0;
+          let maxMisses = 0;
+          for (const item of list) {
+            brierSum += Math.pow(item.predictedProbability - item.y, 2);
+            logLossSum += -(item.y * Math.log(item.predictedProbability) + (1 - item.y) * Math.log(1 - item.predictedProbability));
+            if (item.signalEmitted) {
+              signals += 1;
+              if (item.hit) {
+                hits += 1;
+                misses = 0;
+              } else {
+                misses += 1;
+                if (misses > maxMisses) maxMisses = misses;
+              }
+            }
+          }
+          return {
+            totalObservations: list.length,
+            totalAnalyticalSignals: signals,
+            overallSignalHitRate: signals > 0 ? Number((hits / signals).toFixed(4)) : 0,
+            brierScore: Number((brierSum / list.length).toFixed(4)),
+            logLoss: Number((logLossSum / list.length).toFixed(4)),
+            maxConsecutiveMisses: maxMisses,
+          };
+        };
+
+        return {
+          combined: summarize(outcomes),
+          outOfSample: summarize(outcomes.slice(oosStart)),
+          uniformBaselineRate: cfg.mode === "MATCHES" ? 0.1 : 0.9,
+          disclaimer:
+            "Strict no-look-ahead evaluation using ticks[0..t-1]. Hit rate, Brier score, and log loss measure statistical accuracy—not actual trading profit.",
+        };
+      }
+
+      // =========================================================================
+      // STAGE 8: ISOLATED SIMULATION ENGINE & TERMINAL UI
+      // =========================================================================
+      class IsolatedSimulationEngine {
+        constructor() {
+          this.epochMs = Date.now();
+          this.counter = 0;
+          this.prices = new Map(INITIAL_SYMBOLS.map((s, idx) => [s, 1000 + idx * 111.25]));
+        }
+        generateBatch(count, symbols, pipSize = 0.01) {
+          const list = symbols && symbols.length > 0 ? symbols : INITIAL_SYMBOLS;
+          const out = [];
+          for (let i = 0; i < count; i++) {
+            this.counter += 1;
+            this.epochMs += 1000;
+            const sym = list[this.counter % list.length];
+            const prev = this.prices.get(sym) ?? 1000;
+            const digit = Math.floor(Math.random() * 10);
+            const delta = (Math.random() < 0.5 ? -1 : 1) * (1 + Math.floor(Math.random() * 9)) * pipSize;
+            const rawNum = Math.max(1, prev + delta).toFixed(2);
+            const quoteStr = `${rawNum.slice(0, -1)}${digit}`;
+            const quoteNum = Number(quoteStr);
+            this.prices.set(sym, quoteNum);
+            out.push({
+              symbol: sym,
+              quoteStr,
+              quoteNum,
+              digit,
+              epochMs: this.epochMs,
+              tickId: `sim_${this.counter}_${this.epochMs}`,
+              dataQualityWarning: "SIMULATED_FEED — Not real Deriv market data",
+            });
+          }
+          return out;
+        }
+      }
+
+      function App() {
+        const [connState, setConnState] = useState("DISCONNECTED");
+        const [feedMode, setFeedMode] = useState("LIVE_PUBLIC");
+        const [appId, setAppId] = useState(DEFAULT_APP_ID);
+        const [reconnectAttempts, setReconnectAttempts] = useState(0);
+        const [rttMs, setRttMs] = useState(null);
+        const [lastError, setLastError] = useState(null);
+        const [diagnostics, setDiagnostics] = useState([]);
+
+        const [simulationActive, setSimulationActive] = useState(false);
+        const [activeSymbol, setActiveSymbol] = useState("1HZ100V");
+        const [availableSymbols, setAvailableSymbols] = useState([]);
+        const [maxBufferSize, setMaxBufferSize] = useState(2000);
+        const [buffers, setBuffers] = useState(() => {
+          const init = {};
+          for (const s of INITIAL_SYMBOLS) {
+            init[s] = {
+              symbol: s,
+              ticks: [],
+              latestTick: null,
+              duplicateTicksDropped: 0,
+              invalidTicksRejected: 0,
+              outOfOrderTicksCount: 0,
+              isStale: false,
+            };
+          }
+          return init;
+        });
+
+        const [windowSize, setWindowSize] = useState(100);
+        const [mode, setMode] = useState("MATCHES");
+        const [targetDigit, setTargetDigit] = useState(0);
+        const [minimumSampleSize, setMinimumSampleSize] = useState(30);
+        const [sensitivity, setSensitivity] = useState(1.0);
+        const [minSignalScore, setMinSignalScore] = useState(55);
+
+        // Scanner state (12s default)
+        const [autoScanEnabled, setAutoScanEnabled] = useState(true);
+        const [scanIntervalMs, setScanIntervalMs] = useState(DEFAULT_SCANNER_INTERVAL_MS);
+        const [remainingMs, setRemainingMs] = useState(DEFAULT_SCANNER_INTERVAL_MS);
+        const [scanHistory, setScanHistory] = useState([]);
+        const [rankedMarkets, setRankedMarkets] = useState([]);
+
+        // Backtest & UI filter state
+        const [backtestReport, setBacktestReport] = useState(null);
+        const [lookbackTicks, setLookbackTicks] = useState(30);
+        const [symbolSearch, setSymbolSearch] = useState("");
+        const [categoryFilter, setCategoryFilter] = useState("ALL");
+
+        const wsRef = useRef(null);
+        const manualDisconnectRef = useRef(false);
+        const reconnectTimerRef = useRef(null);
+        const heartbeatTimerRef = useRef(null);
+        const pingSentAtRef = useRef(null);
+        const pendingReqRef = useRef(new Map());
+        const reqSeqRef = useRef(0);
+        const subMapRef = useRef(new Map()); // symbol -> subId
+        const simRef = useRef(new IsolatedSimulationEngine());
+        const buffersRef = useRef(buffers);
+        buffersRef.current = buffers;
+
+        const endpoint =
+          feedMode === "LEGACY_ADAPTER" ? `${LEGACY_V3_WS_BASE}?app_id=${appId}` : PUBLIC_OPTIONS_WS;
+
+        const pushDiag = useCallback((level, code, message) => {
+          setDiagnostics((prev) => [
+            ...prev.slice(-79),
+            { id: `${Date.now()}_${Math.random().toString(36).slice(2, 7)}`, timestamp: Date.now(), level, code, message },
+          ]);
+        }, []);
+
+        const ingestTick = useCallback((tick, nowMs = Date.now()) => {
+          if (!tick || typeof tick.digit !== "number" || tick.digit < 0 || tick.digit > 9) return;
+          setBuffers((prev) => {
+            const cur = prev[tick.symbol] || {
+              symbol: tick.symbol,
+              ticks: [],
+              latestTick: null,
+              duplicateTicksDropped: 0,
+              invalidTicksRejected: 0,
+              outOfOrderTicksCount: 0,
+              isStale: false,
+            };
+            const latest = cur.latestTick;
+            if (latest) {
+              if ((tick.tickId && latest.tickId && tick.tickId === latest.tickId) || (latest.epochMs === tick.epochMs && latest.quoteStr === tick.quoteStr)) {
+                return { ...prev, [tick.symbol]: { ...cur, duplicateTicksDropped: cur.duplicateTicksDropped + 1 } };
+              }
+              if (tick.epochMs < latest.epochMs) {
+                return { ...prev, [tick.symbol]: { ...cur, outOfOrderTicksCount: cur.outOfOrderTicksCount + 1 } };
+              }
+            }
+            const nextTicks =
+              cur.ticks.length >= maxBufferSize
+                ? [...cur.ticks.slice(cur.ticks.length - maxBufferSize + 1), tick]
+                : [...cur.ticks, tick];
+            return {
+              ...prev,
+              [tick.symbol]: {
+                ...cur,
+                ticks: nextTicks,
+                latestTick: tick,
+                isStale: nowMs - tick.epochMs > STALE_THRESHOLD_MS,
+              },
+            };
+          });
+        }, [maxBufferSize]);
+
+        const sendRequest = useCallback((payload, method = "req") => {
+          return new Promise((resolve, reject) => {
+            const sock = wsRef.current;
+            if (!sock || sock.readyState !== 1) {
+              reject(new Error(`Socket not connected for ${method}`));
+              return;
+            }
+            const reqId = `dq_${++reqSeqRef.current}_${Date.now()}`;
+            const timer = setTimeout(() => {
+              pendingReqRef.current.delete(reqId);
+              reject(new Error(`Timeout on ${method}`));
+            }, 12000);
+            pendingReqRef.current.set(reqId, { resolve, reject, timer });
+            sock.send(JSON.stringify({ ...payload, req_id: reqId }));
+          });
+        }, []);
+
+        const subscribeSymbol = useCallback(async (sym) => {
+          if (!wsRef.current || wsRef.current.readyState !== 1) return;
+          try {
+            const res = await sendRequest({ ticks: sym, subscribe: 1 }, `ticks:${sym}`);
+            if (res?.subscription?.id) {
+              subMapRef.current.set(sym, res.subscription.id);
+            }
+          } catch (e) {
+            pushDiag("warn", "SUB_ERR", e.message);
+          }
+        }, [pushDiag, sendRequest]);
+
+        const unsubscribeSymbol = useCallback(async (sym) => {
+          const subId = subMapRef.current.get(sym);
+          subMapRef.current.delete(sym);
+          if (subId && wsRef.current && wsRef.current.readyState === 1) {
+            try {
+              await sendRequest({ forget: subId }, `forget:${sym}`);
+            } catch {
+              // ignore cleanup timeout
+            }
+          }
+        }, [sendRequest]);
+
+        const discoverSymbols = useCallback(async () => {
+          try {
+            const res = await sendRequest({ active_symbols: "brief" }, "active_symbols");
+            const list = normalizeSymbols(res);
+            if (list.length > 0) {
+              setAvailableSymbols(list);
+              pushDiag("info", "SYMBOLS_OK", `Discovered ${list.length} active symbols.`);
+            }
+          } catch (e) {
+            pushDiag("warn", "SYMBOLS_ERR", e.message);
+          }
+        }, [pushDiag, sendRequest]);
+
+        const openSocket = useCallback((isReconnect = false) => {
+          if (wsRef.current) {
+            try { wsRef.current.close(1000, "Reset"); } catch {}
+            wsRef.current = null;
+          }
+          setConnState(isReconnect ? "RECONNECTING" : "CONNECTING");
+          setLastError(null);
+
+          const sock = new WebSocket(endpoint);
+          wsRef.current = sock;
+
+          const connectTimer = setTimeout(() => {
+            if (wsRef.current === sock && sock.readyState !== 1) {
+              setConnState("ERROR");
+              setLastError("Connection timed out");
+              pushDiag("error", "CONNECT_TIMEOUT", "WebSocket connection attempt timed out.");
+              sock.close();
+            }
+          }, 10000);
+
+          sock.addEventListener("open", async () => {
+            clearTimeout(connectTimer);
+            setConnState("CONNECTED");
+            setReconnectAttempts(0);
+            pushDiag("info", "WS_OPEN", `Connected to ${endpoint}`);
+
+            clearInterval(heartbeatTimerRef.current);
+            heartbeatTimerRef.current = setInterval(() => {
+              if (sock.readyState === 1) {
+                pingSentAtRef.current = Date.now();
+                sock.send(JSON.stringify({ ping: 1, req_id: `ping_${Date.now()}` }));
+              }
+            }, 25000);
+
+            if (isReconnect) {
+              const previousSubs = Array.from(subMapRef.current.keys());
+              subMapRef.current.clear();
+              for (const s of previousSubs) await subscribeSymbol(s);
+            } else {
+              await discoverSymbols();
+              await subscribeSymbol(activeSymbol);
+            }
+          });
+
+          sock.addEventListener("message", (ev) => {
+            let msg;
+            try {
+              msg = JSON.parse(String(ev.data));
+            } catch {
+              pushDiag("warn", "MALFORMED_JSON", "Dropped non-JSON WebSocket frame.");
+              return;
+            }
+            if (!msg || typeof msg !== "object") return;
+
+            if (msg.pong !== undefined) {
+              if (pingSentAtRef.current !== null) {
+                setRttMs(Math.max(1, Date.now() - pingSentAtRef.current));
+                pingSentAtRef.current = null;
+              }
+            }
+
+            if (msg.req_id && pendingReqRef.current.has(String(msg.req_id))) {
+              const entry = pendingReqRef.current.get(String(msg.req_id));
+              clearTimeout(entry.timer);
+              pendingReqRef.current.delete(String(msg.req_id));
+              if (msg.error) entry.reject(new Error(msg.error.message || "API error"));
+              else entry.resolve(msg);
+            }
+
+            if (msg.tick) {
+              const sym = msg.tick.symbol || activeSymbol;
+              const meta = availableSymbols.find((x) => x.symbol === sym);
+              const parsed = parseInboundTick(msg, meta, sym);
+              if (parsed) ingestTick(parsed);
+            }
+          });
+
+          sock.addEventListener("close", () => {
+            clearTimeout(connectTimer);
+            clearInterval(heartbeatTimerRef.current);
+            for (const [, p] of pendingReqRef.current.entries()) {
+              clearTimeout(p.timer);
+              p.reject(new Error("Socket closed"));
+            }
+            pendingReqRef.current.clear();
+
+            if (manualDisconnectRef.current) {
+              setConnState("DISCONNECTED");
+              pushDiag("info", "WS_CLOSED", "Disconnected by user.");
+              return;
+            }
+
+            setReconnectAttempts((prev) => {
+              const next = prev + 1;
+              if (next > 12) {
+                setConnState("ERROR");
+                setLastError("Max reconnection attempts exceeded.");
+                pushDiag("error", "MAX_RETRY", "Stopped reconnecting after 12 attempts.");
+                return prev;
+              }
+              const delay = computeBackoffMs(next - 1);
+              setConnState("RECONNECTING");
+              pushDiag("info", "RECONNECT", `Reconnect attempt ${next} in ${delay}ms.`);
+              reconnectTimerRef.current = setTimeout(() => openSocket(true), delay);
+              return next;
+            });
+          });
+
+          sock.addEventListener("error", () => {
+            pushDiag("error", "WS_ERROR", "WebSocket transport error occurred.");
+          });
+        }, [activeSymbol, availableSymbols, discoverSymbols, endpoint, ingestTick, pushDiag, subscribeSymbol]);
+
+        const connectFeed = useCallback(() => {
+          setSimulationActive(false);
+          manualDisconnectRef.current = false;
+          openSocket(false);
+        }, [openSocket]);
+
+        const disconnectFeed = useCallback(() => {
+          manualDisconnectRef.current = true;
+          clearTimeout(reconnectTimerRef.current);
+          clearInterval(heartbeatTimerRef.current);
+          if (wsRef.current) {
+            try { wsRef.current.close(1000, "User disconnect"); } catch {}
+          }
+          setConnState("DISCONNECTED");
+        }, []);
+
+        useEffect(() => {
+          return () => {
+            manualDisconnectRef.current = true;
+            clearTimeout(reconnectTimerRef.current);
+            clearInterval(heartbeatTimerRef.current);
+            if (wsRef.current) {
+              try { wsRef.current.close(1000, "Unmount"); } catch {}
+            }
+          };
+        }, []);
+
+        // Simulation loop (strictly isolated from live WebSocket)
+        useEffect(() => {
+          if (!simulationActive) return;
+          const seed = simRef.current.generateBatch(45, [activeSymbol], 0.01);
+          for (const t of seed) ingestTick(t);
+          const id = setInterval(() => {
+            const next = simRef.current.generateBatch(1, [activeSymbol], 0.01);
+            for (const t of next) ingestTick(t);
+          }, 1000);
+          return () => clearInterval(id);
+        }, [simulationActive, activeSymbol, ingestTick]);
+
+        // Scanner loop (12s default, non-blocking)
+        const triggerManualScan = useCallback(() => {
+          queueMicrotask(() => {
+            const snap = runMultiMarketScan(buffersRef.current, {
+              windowSize,
+              mode,
+              targetDigit,
+            });
+            setRankedMarkets(snap.rows);
+            setScanHistory((prev) => [snap, ...prev].slice(0, 25));
+            setRemainingMs(scanIntervalMs);
+          });
+        }, [mode, targetDigit, windowSize, scanIntervalMs]);
+
+        useEffect(() => {
+          if (!autoScanEnabled) return;
+          const stepMs = 500;
+          const timer = setInterval(() => {
+            setRemainingMs((prev) => {
+              if (prev - stepMs <= 0) {
+                triggerManualScan();
+                return scanIntervalMs;
+              }
+              return prev - stepMs;
+            });
+          }, stepMs);
+          return () => clearInterval(timer);
+        }, [autoScanEnabled, scanIntervalMs, triggerManualScan]);
+
+        const handleSelectSymbol = useCallback(async (nextSym) => {
+          const prevSym = activeSymbol;
+          setActiveSymbol(nextSym);
+          setBuffers((prev) =>
+            prev[nextSym]
+              ? prev
+              : {
+                  ...prev,
+                  [nextSym]: {
+                    symbol: nextSym,
+                    ticks: [],
+                    latestTick: null,
+                    duplicateTicksDropped: 0,
+                    invalidTicksRejected: 0,
+                    outOfOrderTicksCount: 0,
+                    isStale: false,
+                  },
+                }
+          );
+          if (wsRef.current && wsRef.current.readyState === 1 && prevSym !== nextSym) {
+            await unsubscribeSymbol(prevSym);
+            await subscribeSymbol(nextSym);
+          }
+        }, [activeSymbol, subscribeSymbol, unsubscribeSymbol]);
+
+        const activeBuffer = buffers[activeSymbol] || null;
+        const activeMeta = useMemo(
+          () => availableSymbols.find((s) => s.symbol === activeSymbol),
+          [availableSymbols, activeSymbol]
+        );
+        const ticks = activeBuffer?.ticks || [];
+
+        const frequency = useMemo(() => analyzeFrequency(activeSymbol, ticks, windowSize), [activeSymbol, ticks, windowSize]);
+        const markov = useMemo(() => analyzeMarkov(activeSymbol, ticks, windowSize), [activeSymbol, ticks, windowSize]);
+        const patterns = useMemo(() => analyzePatterns(activeSymbol, ticks, windowSize), [activeSymbol, ticks, windowSize]);
+        const statistics = useMemo(() => runStatistics(activeSymbol, ticks, windowSize), [activeSymbol, ticks, windowSize]);
+        const matchDiffer = useMemo(
+          () =>
+            evaluateMatchesAndDiffers(activeSymbol, ticks, {
+              mode,
+              targetDigit,
+              windowSize,
+              minimumSampleSize,
+              sensitivity,
+            }),
+          [activeSymbol, ticks, mode, targetDigit, windowSize, minimumSampleSize, sensitivity]
+        );
+        const signal = useMemo(
+          () =>
+            evaluateSignal(
+              {
+                symbol: activeSymbol,
+                mode,
+                targetDigit,
+                windowSize,
+                ticks,
+                isFeedStale: Boolean(activeBuffer?.isStale),
+                hasPrecisionWarning: Boolean(activeMeta?.hasPrecisionWarning || activeBuffer?.latestTick?.dataQualityWarning),
+                markov,
+                patterns,
+                statistics,
+              },
+              { minimumScoreForSignal: minSignalScore, minimumSampleSize, sensitivity }
+            ),
+          [activeSymbol, mode, targetDigit, windowSize, ticks, activeBuffer, activeMeta, markov, patterns, statistics, minSignalScore, minimumSampleSize, sensitivity]
+        );
+
+        const catalog = useMemo(() => {
+          if (availableSymbols.length > 0) return availableSymbols;
+          return INITIAL_SYMBOLS.map((sym) => ({
+            symbol: sym,
+            name: sym.startsWith("1HZ") ? `Volatility ${sym.replace("1HZ", "").replace("V", "")} (1s)` : `Volatility ${sym.replace("R_", "")}`,
+            category: sym.startsWith("1HZ") ? "Volatility 1s" : "Standard Volatility",
+            pipSize: 0.01,
+            displayDecimals: 2,
+            isPreferred: true,
+            hasPrecisionWarning: false,
+          }));
+        }, [availableSymbols]);
+
+        const categories = useMemo(() => ["ALL", ...Array.from(new Set(catalog.map((c) => c.category)))], [catalog]);
+        const filteredCatalog = useMemo(() => {
+          const q = symbolSearch.trim().toLowerCase();
+          return catalog.filter((item) => {
+            if (categoryFilter !== "ALL" && item.category !== categoryFilter) return false;
+            if (!q) return true;
+            return item.symbol.toLowerCase().includes(q) || item.name.toLowerCase().includes(q);
+          });
+        }, [catalog, categoryFilter, symbolSearch]);
+
+        const stateBadge = {
+          CONNECTED: "border-emerald-500/40 bg-emerald-950/40 text-emerald-300",
+          CONNECTING: "border-cyan-500/40 bg-cyan-950/40 text-cyan-300",
+          RECONNECTING: "border-amber-500/40 bg-amber-950/40 text-amber-300",
+          DISCONNECTED: "border-slate-600/50 bg-slate-900/70 text-slate-300",
+          ERROR: "border-red-500/50 bg-red-950/50 text-red-300",
+        }[connState] || "border-slate-600/50 bg-slate-900/70 text-slate-300";
+
+        const chartData = frequency.digits.map((d) => ({
+          digit: `D${d.digit}`,
+          frequencyPct: d.frequencyPct,
+          count: d.count,
+          deviationPct: d.deviationPct,
+          classification: d.classification,
+        }));
+
+        const latestTick = activeBuffer?.latestTick || null;
+        const recentDigits = ticks.slice(-12).map((t) => t.digit);
+        const bufCount = ticks.length;
+        const fillPct = Math.min(100, Math.round((bufCount / maxBufferSize) * 100));
+
+        return h(
+          "div",
+          { className: "min-h-screen bg-[#060913] text-slate-100" },
+          h(
+            "div",
+            { className: "mx-auto max-w-[1600px] space-y-4 p-3 sm:p-5" },
+
+            // HEADER & CONNECTION MANAGER
+            h(
+              "header",
+              { className: "terminal-panel px-4 py-3.5 sm:px-6" },
+              h(
+                "div",
+                { className: "flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between" },
+                h(
+                  "div",
+                  { className: "space-y-1" },
+                  h(
+                    "div",
+                    { className: "flex flex-wrap items-center gap-2.5" },
+                    h("span", { className: "inline-flex h-7 w-7 items-center justify-center rounded-md bg-cyan-500/15 text-cyan-400 ring-1 ring-cyan-500/30" }, h(Cpu, { className: "h-4 w-4" })),
+                    h("h1", { className: "text-base font-bold tracking-tight text-white sm:text-lg" }, "DERIV QUANT AI"),
+                    h("span", { className: "rounded bg-cyan-500/10 px-2 py-0.5 text-[11px] font-medium uppercase tracking-wider text-cyan-300 ring-1 ring-cyan-500/30" }, "Digit Intelligence Terminal"),
+                    h("span", { className: `inline-flex items-center gap-1.5 rounded-full border px-2.5 py-0.5 text-[11px] font-semibold font-mono-tabular ${stateBadge}` }, connState)
+                  ),
+                  h(
+                    "div",
+                    { className: "flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-slate-400 font-mono-tabular" },
+                    h("span", null, `Endpoint: ${endpoint}`),
+                    h("span", null, `Mode: ${feedMode}`),
+                    h("span", null, `App ID: ${appId}`),
+                    h("span", null, `RTT: ${rttMs !== null ? `${rttMs} ms` : "—"}`),
+                    reconnectAttempts > 0 ? h("span", { className: "text-amber-300" }, `Retries: ${reconnectAttempts}`) : null
+                  ),
+                  lastError ? h("p", { className: "text-xs text-red-400" }, `Error: ${lastError}`) : null
+                ),
+                h(
+                  "div",
+                  { className: "flex flex-wrap items-center gap-2" },
+                  connState !== "CONNECTED"
+                    ? h(
+                        "button",
+                        {
+                          type: "button",
+                          onClick: connectFeed,
+                          className: "inline-flex items-center gap-1.5 rounded-lg bg-emerald-500/20 px-3.5 py-2 text-xs font-semibold text-emerald-200 ring-1 ring-emerald-500/40 hover:bg-emerald-500/30",
+                        },
+                        h(PlugZap, { className: "h-3.5 w-3.5" }),
+                        "Connect Public Feed"
+                      )
+                    : h(
+                        "button",
+                        {
+                          type: "button",
+                          onClick: disconnectFeed,
+                          className: "inline-flex items-center gap-1.5 rounded-lg bg-red-500/15 px-3.5 py-2 text-xs font-semibold text-red-200 ring-1 ring-red-500/40 hover:bg-red-500/25",
+                        },
+                        h(Plug, { className: "h-3.5 w-3.5" }),
+                        "Disconnect"
+                      ),
+                  h(
+                    "button",
+                    {
+                      type: "button",
+                      onClick: discoverSymbols,
+                      disabled: connState !== "CONNECTED",
+                      className: "inline-flex items-center gap-1.5 rounded-lg border border-slate-700 bg-slate-900/80 px-3 py-2 text-xs font-medium text-slate-200 hover:border-cyan-500/50 disabled:opacity-40",
+                    },
+                    h(RefreshCw, { className: "h-3.5 w-3.5" }),
+                    "Discover Symbols"
+                  ),
+                  h(
+                    "button",
+                    {
+                      type: "button",
+                      onClick: () => setSimulationActive((s) => !s),
+                      className={`inline-flex items-center gap-1.5 rounded-lg border px-3 py-2 text-xs font-medium ${
+                        simulationActive ? "border-amber-400/60 bg-amber-500/20 text-amber-200" : "border-slate-700 bg-slate-900/80 text-slate-300 hover:border-cyan-500/40"
+                      }`,
+                    },
+                    h(FlaskConical, { className: "h-3.5 w-3.5" }),
+                    simulationActive ? "Simulating" : "Simulation Mode"
+                  ),
+                  h("span", { className: "hidden items-center gap-1 rounded-lg border border-slate-800 bg-[#070b16] px-2.5 py-2 text-[11px] text-slate-400 xl:inline-flex" }, h(Activity, { className: "h-3.5 w-3.5 text-cyan-400" }), "Research Only")
+                )
+              )
+            ),
+
+            // SIMULATION BANNER
+            simulationActive
+              ? h(
+                  "div",
+                  { className: "flex flex-wrap items-center justify-between gap-3 rounded-lg border border-amber-500/40 bg-amber-950/40 px-4 py-2.5 text-xs text-amber-200" },
+                  h(
+                    "div",
+                    { className: "flex items-center gap-2" },
+                    h(FlaskConical, { className: "h-4 w-4 text-amber-400" }),
+                    h("span", null, h("strong", { className: "text-amber-300" }, "Simulation Mode Active: "), "Synthetic tick stream isolated from live Deriv WebSocket—not real Deriv market data.")
+                  ),
+                  h(
+                    "button",
+                    {
+                      type: "button",
+                      onClick: () => setSimulationActive(false),
+                      className: "rounded border border-amber-400/50 bg-amber-500/20 px-2.5 py-1 text-xs font-medium text-amber-100",
+                    },
+                    "Exit Simulation"
+                  )
+                )
+              : null,
+
+            // MAIN GRID
+            h(
+              "div",
+              { className: "grid grid-cols-1 gap-4 xl:grid-cols-12" },
+
+              // LEFT COLUMN: LIVE DIGIT, BUFFER STATUS, MARKET SELECTOR
+              h(
+                "div",
+                { className: "space-y-4 xl:col-span-4" },
+
+                h(
+                  "section",
+                  { className: "terminal-panel p-4" },
+                  h(
+                    "div",
+                    { className: "flex items-start justify-between gap-2" },
+                    h(
+                      "div",
+                      null,
+                      h("div", { className: "text-xs font-medium uppercase tracking-wider text-slate-400" }, "Active Market Feed"),
+                      h("h2", { className: "mt-0.5 text-lg font-bold text-white font-mono-tabular" }, activeSymbol),
+                      h("p", { className: "text-xs text-slate-400" }, `${activeMeta?.name || "Volatility Index"} · ${activeMeta?.category || "Synthetic"}`)
+                    ),
+                    h(
+                      "div",
+                      { className: "flex flex-col items-end" },
+                      h("span", { className: "text-[11px] uppercase text-slate-400" }, "Last Digit"),
+                      h("div", { className: "mt-1 flex h-12 w-12 items-center justify-center rounded-xl border border-cyan-500/40 bg-cyan-500/15 text-2xl font-bold text-cyan-200 font-mono-tabular" }, latestTick && latestTick.digit !== null ? latestTick.digit : "—")
+                    )
+                  ),
+                  h(
+                    "div",
+                    { className: "mt-4 grid grid-cols-2 gap-3 rounded-lg border border-slate-800/90 bg-[#070b16] p-3 font-mono-tabular" },
+                    h("div", null, h("div", { className: "text-[11px] text-slate-400" }, "Current Quote"), h("div", { className: "mt-0.5 text-sm font-semibold text-white" }, latestTick ? latestTick.quoteStr : "Awaiting ticks...")),
+                    h("div", null, h("div", { className: "flex items-center gap-1 text-[11px] text-slate-400" }, h(Clock, { className: "h-3 w-3" }), "Timestamp"), h("div", { className: "mt-0.5 text-xs text-slate-200" }, latestTick ? new Date(latestTick.epochMs).toLocaleTimeString() : "—"))
+                  ),
+                  h(
+                    "div",
+                    { className: "mt-3" },
+                    h("div", { className: "mb-1.5 flex items-center gap-1 text-[11px] text-slate-400" }, h(Hash, { className: "h-3 w-3 text-cyan-400" }), "Recent Digits (latest 12)"),
+                    h(
+                      "div",
+                      { className: "flex flex-wrap gap-1.5 font-mono-tabular" },
+                      recentDigits.length > 0
+                        ? recentDigits.map((d, idx) =>
+                            h(
+                              "span",
+                              {
+                                key: `${idx}-${d}`,
+                                className: `inline-flex h-6 w-6 items-center justify-center rounded text-xs font-semibold ${
+                                  idx === recentDigits.length - 1 ? "bg-cyan-500 text-slate-950" : "bg-slate-800/90 text-slate-200"
+                                }`,
+                              },
+                              d
+                            )
+                          )
+                        : h("span", { className: "text-xs text-slate-500" }, "No ticks buffered yet")
+                    )
+                  ),
+                  latestTick?.dataQualityWarning
+                    ? h(
+                        "div",
+                        { className: "mt-3 flex items-start gap-2 rounded-lg border border-amber-500/40 bg-amber-950/30 p-2.5 text-xs text-amber-200" },
+                        h(AlertTriangle, { className: "mt-0.5 h-3.5 w-3.5 shrink-0 text-amber-400" }),
+                        h("span", null, latestTick.dataQualityWarning)
+                      )
+                    : null
+                ),
+
+                h(
+                  "section",
+                  { className: "terminal-panel p-4" },
+                  h(
+                    "div",
+                    { className: "flex items-center justify-between gap-2" },
+                    h("div", { className: "flex items-center gap-2" }, h(Database, { className: "h-4 w-4 text-cyan-400" }), h("h2", { className: "text-sm font-semibold text-white" }, "Buffer & Feed Hygiene")),
+                    h("span", { className: `rounded-full px-2 py-0.5 text-[11px] font-semibold font-mono-tabular ${activeBuffer?.isStale ? "bg-red-500/20 text-red-300" : bufCount > 0 ? "bg-emerald-500/15 text-emerald-300" : "bg-slate-800 text-slate-400"}` }, activeBuffer?.isStale ? "STALE" : bufCount > 0 ? "FRESH" : "EMPTY")
+                  ),
+                  h(
+                    "div",
+                    { className: "mt-3 space-y-1.5" },
+                    h("div", { className: "flex justify-between text-xs font-mono-tabular text-slate-300" }, h("span", null, `Buffered: ${bufCount} / ${maxBufferSize}`), h("span", null, `${fillPct}%`)),
+                    h("div", { className: "h-2 w-full overflow-hidden rounded-full bg-slate-800" }, h("div", { className: "h-full bg-cyan-400", style: { width: `${fillPct}%` } }))
+                  ),
+                  h(
+                    "div",
+                    { className: "mt-3 grid grid-cols-3 gap-2 text-center font-mono-tabular" },
+                    h("div", { className: "rounded-lg border border-slate-800 bg-[#070b16] p-2" }, h("div", { className: "text-[10px] text-slate-400" }, "DUPES"), h("div", { className: "text-sm font-semibold text-amber-300" }, activeBuffer?.duplicateTicksDropped ?? 0)),
+                    h("div", { className: "rounded-lg border border-slate-800 bg-[#070b16] p-2" }, h("div", { className: "text-[10px] text-slate-400" }, "INVALID"), h("div", { className: "text-sm font-semibold text-red-300" }, activeBuffer?.invalidTicksRejected ?? 0)),
+                    h("div", { className: "rounded-lg border border-slate-800 bg-[#070b16] p-2" }, h("div", { className: "text-[10px] text-slate-400" }, "OUT-OF-ORDER"), h("div", { className: "text-sm font-semibold text-slate-200" }, activeBuffer?.outOfOrderTicksCount ?? 0))
+                  ),
+                  h(
+                    "div",
+                    { className: "mt-3 flex items-center justify-between gap-2" },
+                    h(
+                      "select",
+                      {
+                        value: maxBufferSize,
+                        onChange: (e) => setMaxBufferSize(Number(e.target.value)),
+                        className: "rounded border border-slate-800 bg-[#070b16] px-2 py-1 text-xs text-slate-200 font-mono-tabular",
+                      },
+                      h("option", { value: 250 }, "Cap: 250"),
+                      h("option", { value: 1000 }, "Cap: 1,000"),
+                      h("option", { value: 2000 }, "Cap: 2,000"),
+                      h("option", { value: 5000 }, "Cap: 5,000")
+                    ),
+                    h(
+                      "button",
+                      {
+                        type: "button",
+                        onClick: () =>
+                          setBuffers((prev) => ({
+                            ...prev,
+                            [activeSymbol]: { symbol: activeSymbol, ticks: [], latestTick: null, duplicateTicksDropped: 0, invalidTicksRejected: 0, outOfOrderTicksCount: 0, isStale: false },
+                          })),
+                        className: "rounded border border-slate-700 bg-slate-900 px-2.5 py-1 text-xs text-slate-300 hover:border-red-500/40 hover:text-red-200",
+                      },
+                      "Clear Buffer"
+                    )
+                  )
+                ),
+
+                h(
+                  "section",
+                  { className: "terminal-panel p-4" },
+                  h("h2", { className: "text-sm font-semibold text-white" }, "Market Discovery & Selection"),
+                  h("p", { className: "mb-2.5 text-xs text-slate-400" }, "Preferred 1s & standard volatility markets + dynamic symbols"),
+                  h(
+                    "div",
+                    { className: "mb-2.5 flex gap-2" },
+                    h("input", {
+                      type: "text",
+                      value: symbolSearch,
+                      onChange: (e) => setSymbolSearch(e.target.value),
+                      placeholder: "Filter symbol...",
+                      className: "flex-1 rounded-lg border border-slate-800 bg-[#070b16] px-2.5 py-1.5 text-xs text-slate-100",
+                    }),
+                    h(
+                      "select",
+                      {
+                        value: categoryFilter,
+                        onChange: (e) => setCategoryFilter(e.target.value),
+                        className: "rounded-lg border border-slate-800 bg-[#070b16] px-2 py-1.5 text-xs text-slate-200",
+                      },
+                      categories.map((c) => h("option", { key: c, value: c }, c))
+                    )
+                  ),
+                  h(
+                    "div",
+                    { className: "max-h-60 overflow-y-auto rounded-lg border border-slate-800" },
+                    h(
+                      "table",
+                      { className: "w-full border-collapse text-left text-xs font-mono-tabular" },
+                      h(
+                        "thead",
+                        { className: "sticky top-0 bg-[#090f1d] text-[10px] uppercase text-slate-400" },
+                        h("tr", null, h("th", { className: "px-2.5 py-2" }, "Market"), h("th", { className: "px-2.5 py-2 text-right" }, "Price"), h("th", { className: "px-2.5 py-2 text-center" }, "Digit"), h("th", { className: "px-2.5 py-2 text-right" }, "Sub"))
+                      ),
+                      h(
+                        "tbody",
+                        { className: "divide-y divide-slate-800/70" },
+                        filteredCatalog.map((item) => {
+                          const b = buffers[item.symbol];
+                          const lt = b?.latestTick;
+                          const isSub = subMapRef.current.has(item.symbol);
+                          return h(
+                            "tr",
+                            {
+                              key: item.symbol,
+                              onClick: () => handleSelectSymbol(item.symbol),
+                              className: `cursor-pointer ${item.symbol === activeSymbol ? "bg-cyan-500/15" : "hover:bg-slate-900/70"}`,
+                            },
+                            h("td", { className: "px-2.5 py-2 font-semibold text-white" }, item.symbol),
+                            h("td", { className: "px-2.5 py-2 text-right text-cyan-300" }, lt ? lt.quoteStr : "—"),
+                            h("td", { className: "px-2.5 py-2 text-center text-emerald-300 font-bold" }, lt && lt.digit !== null ? lt.digit : "—"),
+                            h("td", { className: "px-2.5 py-2 text-right text-slate-400" }, isSub ? "ACTIVE" : "IDLE")
+                          );
+                        })
+                      )
+                    )
+                  )
+                )
+              ),
+
+              // RIGHT COLUMN: MATCHES/DIFFERS, SIGNAL, FREQUENCY CHART, HOT/COLD/OVERDUE, MARKOV, PATTERNS
+              h(
+                "div",
+                { className: "space-y-4 xl:col-span-8" },
+
+                h(
+                  "div",
+                  { className: "grid grid-cols-1 gap-4 lg:grid-cols-2" },
+
+                  // MATCHES & DIFFERS PANEL
+                  h(
+                    "section",
+                    { className: "terminal-panel p-4" },
+                    h(
+                      "div",
+                      { className: "mb-3 flex items-center justify-between gap-2" },
+                      h("div", { className: "flex items-center gap-2" }, h(Crosshair, { className: "h-4 w-4 text-cyan-400" }), h("h2", { className: "text-sm font-semibold text-white" }, "Matches & Differs Intelligence")),
+                      h(
+                        "div",
+                        { className: "flex rounded-lg border border-slate-800 bg-[#070b16] p-0.5 text-xs font-mono-tabular" },
+                        ["MATCHES", "DIFFERS"].map((m) =>
+                          h(
+                            "button",
+                            {
+                              key: m,
+                              type: "button",
+                              onClick: () => setMode(m),
+                              className: `rounded px-2.5 py-1 ${mode === m ? "bg-cyan-500 text-slate-950 font-semibold" : "text-slate-300"}`,
+                            },
+                            m
+                          )
+                        )
+                      )
+                    ),
+                    h(
+                      "div",
+                      { className: "mb-3 grid grid-cols-10 gap-1 font-mono-tabular" },
+                      Array.from({ length: 10 }, (_, d) =>
+                        h(
+                          "button",
+                          {
+                            key: d,
+                            type: "button",
+                            onClick: () => setTargetDigit(d),
+                            className: `rounded py-1.5 text-xs font-bold ${targetDigit === d ? "bg-emerald-500 text-slate-950" : "border border-slate-800 bg-[#070b16] text-slate-200"}`,
+                          },
+                          d
+                        )
+                      )
+                    ),
+                    h(
+                      "div",
+                      { className: "mb-3 grid grid-cols-2 gap-2 text-xs font-mono-tabular" },
+                      h("label", { className: "rounded border border-slate-800 bg-[#070b16] p-2" }, h("span", { className: "block text-[10px] text-slate-400" }, "Min Sample"), h("input", { type: "number", min: 10, max: 500, value: minimumSampleSize, onChange: (e) => setMinimumSampleSize(Number(e.target.value)), className: "w-full bg-transparent text-white" })),
+                      h("label", { className: "rounded border border-slate-800 bg-[#070b16] p-2" }, h("span", { className: "block text-[10px] text-slate-400" }, `Sensitivity (${sensitivity.toFixed(1)}x)`), h("input", { type: "range", min: 0.5, max: 2, step: 0.1, value: sensitivity, onChange: (e) => setSensitivity(Number(e.target.value)), className: "w-full accent-cyan-400" }))
+                    ),
+                    h(
+                      "div",
+                      { className: "grid grid-cols-2 gap-2 rounded-lg border border-slate-800 bg-[#070b16] p-3 text-xs font-mono-tabular sm:grid-cols-4" },
+                      h("div", null, h("div", { className: "text-[10px] text-slate-400" }, `Obs ${mode}`), h("div", { className: "text-sm font-bold text-cyan-300" }, `${(matchDiffer.selectedCandidate.observedModeProb * 100).toFixed(2)}%`)),
+                      h("div", null, h("div", { className: "text-[10px] text-slate-400" }, "Baseline"), h("div", { className: "text-sm font-semibold text-slate-300" }, `${(matchDiffer.selectedCandidate.uniformBaselineProb * 100).toFixed(0)}%`)),
+                      h("div", null, h("div", { className: "text-[10px] text-slate-400" }, "Est. Prob"), h("div", { className: "text-sm font-bold text-emerald-300" }, `${(matchDiffer.selectedCandidate.estimatedProbability * 100).toFixed(2)}%`)),
+                      h("div", null, h("div", { className: "text-[10px] text-slate-400" }, "95% CI"), h("div", { className: "text-xs text-slate-200" }, `${(matchDiffer.selectedCandidate.confidenceInterval.lower * 100).toFixed(1)}–${(matchDiffer.selectedCandidate.confidenceInterval.upper * 100).toFixed(1)}%`))
+                    ),
+                    h("p", { className: "mt-2 text-[11px] text-slate-400" }, matchDiffer.statisticalCaveat)
+                  ),
+
+                  // ANALYTICAL SIGNAL CARD
+                  h(
+                    "section",
+                    { className: "terminal-panel p-4" },
+                    h(
+                      "div",
+                      { className: "flex items-start justify-between gap-2" },
+                      h(
+                        "div",
+                        { className: "flex items-center gap-2" },
+                        signal.status === "SIGNAL" ? h(ShieldCheck, { className: "h-5 w-5 text-emerald-400" }) : h(ShieldOff, { className: "h-5 w-5 text-slate-400" }),
+                        h("div", null, h("h2", { className: "text-sm font-semibold text-white" }, "Analytical Evidence Signal"), h("p", { className: "text-xs text-slate-400" }, `${signal.symbol} · n=${signal.sampleSize}`))
+                      ),
+                      h(
+                        "div",
+                        { className: "text-right font-mono-tabular" },
+                        h("div", { className: "text-lg font-bold text-cyan-300" }, `${signal.analyticalScore} `, h("span", { className: "text-xs font-normal text-slate-400" }, "/ 100")),
+                        h("div", { className: `text-[10px] font-semibold ${signal.status === "SIGNAL" ? "text-emerald-300" : "text-amber-300"}` }, signal.status === "SIGNAL" ? `${signal.classification} · D${signal.targetDigit}` : "NO SIGNAL")
+                      )
+                    ),
+                    h(
+                      "div",
+                      { className: "mt-3 rounded-lg border border-slate-800 bg-[#070b16] p-3 text-xs font-mono-tabular" },
+                      h("div", { className: "flex justify-between" }, h("span", { className: "text-slate-400" }, "Evidence Tier:"), h("span", { className: "font-semibold text-white" }, signal.evidenceTier)),
+                      h("div", { className: "mt-1 flex justify-between" }, h("span", { className: "text-slate-400" }, "Prob. Estimate:"), h("span", { className: "font-semibold text-emerald-300" }, signal.statisticalProbabilityEstimate !== null ? `${(signal.statisticalProbabilityEstimate * 100).toFixed(2)}%` : "Withheld (NO SIGNAL)"))
+                    ),
+                    signal.noSignalReasons.length > 0
+                      ? h(
+                          "div",
+                          { className: "mt-2.5 rounded-lg border border-amber-500/30 bg-amber-950/25 p-2.5 text-xs text-amber-200 space-y-1" },
+                          signal.noSignalReasons.map((r, idx) => h("div", { key: idx }, `• ${r}`))
+                        )
+                      : null,
+                    h(
+                      "div",
+                      { className: "mt-2.5 space-y-1 text-[11px] text-slate-300" },
+                      signal.supportingEvidence.map((ev, idx) => h("div", { key: idx }, `· ${ev}`))
+                    ),
+                    h("p", { className: "mt-2 border-t border-slate-800 pt-2 text-[11px] text-red-300/90" }, signal.riskWarnings[0])
+                  )
+                ),
+
+                // FREQUENCY CHART & WINDOW SELECTOR
+                h(
+                  "section",
+                  { className: "terminal-panel p-4" },
+                  h(
+                    "div",
+                    { className: "mb-3 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between" },
+                    h("div", null, h("h2", { className: "text-sm font-semibold text-white" }, "Digit Frequency Distribution (0–9)"), h("p", { className: "text-xs text-slate-400" }, `Observed % vs 10% uniform baseline · Sample n=${frequency.sampleSize}`)),
+                    h(
+                      "div",
+                      { className: "flex flex-wrap gap-1 font-mono-tabular" },
+                      SUPPORTED_WINDOWS.map((w) =>
+                        h(
+                          "button",
+                          {
+                            key: w,
+                            type: "button",
+                            onClick: () => setWindowSize(w),
+                            className: `rounded px-2 py-1 text-xs ${windowSize === w ? "bg-cyan-500 text-slate-950 font-semibold" : "border border-slate-800 bg-slate-900 text-slate-300"}`,
+                          },
+                          w
+                        )
+                      )
+                    )
+                  ),
+                  h(
+                    "div",
+                    { className: "h-52 w-full" },
+                    h(
+                      ResponsiveContainer,
+                      { width: "100%", height: "100%" },
+                      h(
+                        BarChart,
+                        { data: chartData, margin: { top: 8, right: 12, left: -12, bottom: 0 } },
+                        h(CartesianGrid, { strokeDasharray: "3 3", stroke: "#1e2d4d", vertical: false }),
+                        h(XAxis, { dataKey: "digit", stroke: "#94a3b8", fontSize: 11 }),
+                        h(YAxis, { stroke: "#94a3b8", fontSize: 11, unit: "%" }),
+                        h(Tooltip, { contentStyle: { backgroundColor: "#0c1324", borderColor: "#1e2d4d", fontSize: "12px" } }),
+                        h(ReferenceLine, { y: 10, stroke: "#06b6d4", strokeDasharray: "4 4" }),
+                        h(
+                          Bar,
+                          { dataKey: "frequencyPct", radius: [4, 4, 0, 0] },
+                          chartData.map((entry) => {
+                            const fill =
+                              entry.classification === "HOT"
+                                ? "#10b981"
+                                : entry.classification === "COLD"
+                                  ? "#ef4444"
+                                  : entry.classification === "OVERDUE"
+                                    ? "#f59e0b"
+                                    : "#06b6d4";
+                            return h(Cell, { key: entry.digit, fill });
+                          })
+                        )
+                      )
+                    )
+                  )
+                ),
+
+                // HOT / COLD / OVERDUE & SEQUENTIAL PATTERNS
+                h(
+                  "div",
+                  { className: "grid grid-cols-1 gap-4 lg:grid-cols-2" },
+                  h(
+                    "section",
+                    { className: "terminal-panel p-4" },
+                    h("h2", { className: "text-sm font-semibold text-white" }, "Hot, Cold & Overdue Intelligence"),
+                    h("p", { className: "mb-3 text-xs text-slate-400" }, frequency.epistemicCaveat),
+                    h(
+                      "div",
+                      { className: "grid grid-cols-2 gap-2 text-xs font-mono-tabular" },
+                      h("div", { className: "rounded border border-emerald-500/25 bg-[#070b16] p-2.5" }, h("div", { className: "flex items-center gap-1 font-semibold text-emerald-300" }, h(Flame, { className: "h-3.5 w-3.5" }), "HOT"), h("div", { className: "mt-1.5 text-white" }, frequency.hotDigits.length > 0 ? frequency.hotDigits.join(", ") : "None")),
+                      h("div", { className: "rounded border border-red-500/25 bg-[#070b16] p-2.5" }, h("div", { className: "flex items-center gap-1 font-semibold text-red-300" }, h(Snowflake, { className: "h-3.5 w-3.5" }), "COLD"), h("div", { className: "mt-1.5 text-white" }, frequency.coldDigits.length > 0 ? frequency.coldDigits.join(", ") : "None")),
+                      h("div", { className: "rounded border border-amber-500/25 bg-[#070b16] p-2.5" }, h("div", { className: "flex items-center gap-1 font-semibold text-amber-300" }, h(Clock, { className: "h-3.5 w-3.5" }), "OVERDUE"), h("div", { className: "mt-1.5 text-white" }, frequency.overdueDigits.length > 0 ? frequency.overdueDigits.join(", ") : "None")),
+                      h("div", { className: "rounded border border-slate-700 bg-[#070b16] p-2.5" }, h("div", { className: "flex items-center gap-1 font-semibold text-slate-300" }, h(Minus, { className: "h-3.5 w-3.5" }), "NEUTRAL"), h("div", { className: "mt-1.5 text-white" }, frequency.neutralDigits.length > 0 ? frequency.neutralDigits.join(", ") : "None"))
+                    )
+                  ),
+
+                  h(
+                    "section",
+                    { className: "terminal-panel p-4" },
+                    h("div", { className: "mb-2 flex items-center gap-2" }, h(Repeat, { className: "h-4 w-4 text-cyan-400" }), h("h2", { className: "text-sm font-semibold text-white" }, "Sequential Pattern Monitor")),
+                    h(
+                      "div",
+                      { className: "grid grid-cols-2 gap-2 text-xs font-mono-tabular" },
+                      h("div", { className: "rounded border border-slate-800 bg-[#070b16] p-2" }, h("div", { className: "text-[10px] text-slate-400" }, "Immediate Repeats"), h("div", { className: "text-sm font-bold text-cyan-300" }, patterns.repeatedImmediateCount)),
+                      h("div", { className: "rounded border border-slate-800 bg-[#070b16] p-2" }, h("div", { className: "text-[10px] text-slate-400" }, "Max Identical Run"), h("div", { className: "text-sm font-bold text-emerald-300" }, patterns.maxConsecutiveRunLength)),
+                      h("div", { className: "rounded border border-slate-800 bg-[#070b16] p-2" }, h("div", { className: "text-[10px] text-slate-400" }, "A-B-A-B Alternations"), h("div", { className: "text-sm font-bold text-white" }, patterns.alternatingPatternCount)),
+                      h("div", { className: "rounded border border-slate-800 bg-[#070b16] p-2" }, h("div", { className: "text-[10px] text-slate-400" }, "Transition Clusters"), h("div", { className: "text-sm font-bold text-amber-300" }, patterns.transitionClusterCount))
+                    ),
+                    h(
+                      "div",
+                      { className: "mt-2.5 flex flex-wrap justify-between gap-2 text-[11px] font-mono-tabular text-slate-300" },
+                      h("span", null, `Odd/Even: ${patterns.oddPct}% / ${patterns.evenPct}%`),
+                      h("span", null, `High(5-9)/Low(0-4): ${patterns.highPct}% / ${patterns.lowPct}%`)
+                    )
+                  )
+                ),
+
+                // 10x10 MARKOV TRANSITION MATRIX
+                h(
+                  "section",
+                  { className: "terminal-panel p-4" },
+                  h("div", { className: "mb-2 flex items-center gap-2" }, h(Grid, { className: "h-4 w-4 text-cyan-400" }), h("h2", { className: "text-sm font-semibold text-white" }, `10×10 Markov Transition Matrix (${markov.totalTransitions} transitions)`)),
+                  h(
+                    "div",
+                    { className: "overflow-x-auto" },
+                    h(
+                      "table",
+                      { className: "w-full border-collapse text-center text-[11px] font-mono-tabular" },
+                      h(
+                        "thead",
+                        null,
+                        h(
+                          "tr",
+                          null,
+                          h("th", { className: "p-1 text-slate-400" }, "t\\t+1"),
+                          Array.from({ length: 10 }, (_, c) => h("th", { key: c, className: "p-1 text-cyan-300" }, c))
+                        )
+                      ),
+                      h(
+                        "tbody",
+                        null,
+                        markov.matrix.map((row, rIdx) =>
+                          h(
+                            "tr",
+                            { key: rIdx },
+                            h("td", { className: "p-1 font-bold text-cyan-300" }, rIdx),
+                            row.map((cell) => {
+                              const alpha = Math.min(0.65, 0.06 + cell.conditionalProbability * 2);
+                              return h(
+                                "td",
+                                {
+                                  key: `${cell.fromDigit}-${cell.toDigit}`,
+                                  style: { backgroundColor: `rgba(6, 182, 212, ${alpha})` },
+                                  className: "border border-slate-900 p-1 text-slate-100",
+                                },
+                                `${(cell.conditionalProbability * 100).toFixed(0)}%`
+                              );
+                            })
+                          )
+                        )
+                      )
+                    )
+                  )
+                )
+              )
+            ),
+
+            // MULTI-MARKET SCANNER (12s DEFAULT)
+            h(
+              "section",
+              { className: "terminal-panel p-4" },
+              h(
+                "div",
+                { className: "mb-3 flex flex-wrap items-center justify-between gap-2" },
+                h("div", { className: "flex items-center gap-2" }, h(Radar, { className: "h-4 w-4 text-cyan-400" }), h("h2", { className: "text-sm font-semibold text-white" }, `Multi-Market Scanner (Scans: ${scanHistory.length})`)),
+                h(
+                  "div",
+                  { className: "flex flex-wrap items-center gap-2 text-xs font-mono-tabular" },
+                  h("span", { className: "rounded border border-slate-800 bg-[#070b16] px-2.5 py-1 text-cyan-300" }, `Next: ${Math.max(0, Math.ceil(remainingMs / 1000))}s`),
+                  h(
+                    "select",
+                    {
+                      value: scanIntervalMs,
+                      onChange: (e) => {
+                        const v = Number(e.target.value);
+                        setScanIntervalMs(v);
+                        setRemainingMs(v);
+                      },
+                      className: "rounded border border-slate-800 bg-[#070b16] px-2 py-1 text-slate-200",
+                    },
+                    h("option", { value: 5000 }, "5s"),
+                    h("option", { value: 12000 }, "12s (Default)"),
+                    h("option", { value: 20000 }, "20s")
+                  ),
+                  h(
+                    "button",
+                    {
+                      type: "button",
+                      onClick: () => setAutoScanEnabled((a) => !a),
+                      className: "inline-flex items-center gap-1 rounded border border-slate-700 bg-slate-900 px-2.5 py-1 text-slate-200",
+                    },
+                    autoScanEnabled ? h(Pause, { className: "h-3 w-3" }) : h(Play, { className: "h-3 w-3" }),
+                    autoScanEnabled ? "Auto On" : "Auto Off"
+                  ),
+                  h(
+                    "button",
+                    {
+                      type: "button",
+                      onClick: triggerManualScan,
+                      className: "rounded bg-cyan-500/20 px-3 py-1 font-semibold text-cyan-200 ring-1 ring-cyan-500/40",
+                    },
+                    "Scan Now"
+                  ),
+                  h(
+                    "button",
+                    {
+                      type: "button",
+                      onClick: () => { setScanHistory([]); setRankedMarkets([]); },
+                      className: "rounded border border-slate-800 bg-[#070b16] p-1 text-slate-400 hover:text-red-300",
+                    },
+                    h(Trash2, { className: "h-3.5 w-3.5" })
+                  )
+                )
+              ),
+              h(
+                "div",
+                { className: "overflow-x-auto rounded-lg border border-slate-800" },
+                h(
+                  "table",
+                  { className: "w-full border-collapse text-left text-xs font-mono-tabular" },
+                  h(
+                    "thead",
+                    { className: "bg-[#090f1d] text-[10px] uppercase text-slate-400" },
+                    h("tr", null, h("th", { className: "px-3 py-2" }, "Rank"), h("th", { className: "px-3 py-2" }, "Symbol"), h("th", { className: "px-3 py-2 text-right" }, "Sample"), h("th", { className: "px-3 py-2 text-right" }, "Max Dev"), h("th", { className: "px-3 py-2 text-right" }, "Shift"), h("th", { className: "px-3 py-2 text-right" }, "Score"), h("th", { className: "px-3 py-2" }, "Flags"))
+                  ),
+                  h(
+                    "tbody",
+                    { className: "divide-y divide-slate-800/70" },
+                    rankedMarkets.length > 0
+                      ? rankedMarkets.map((r) =>
+                          h(
+                            "tr",
+                            { key: r.symbol, onClick: () => handleSelectSymbol(r.symbol), className: "cursor-pointer hover:bg-slate-900/70" },
+                            h("td", { className: "px-3 py-2 text-slate-400" }, `#${r.rank}`),
+                            h("td", { className: "px-3 py-2 font-semibold text-white" }, r.symbol),
+                            h("td", { className: "px-3 py-2 text-right" }, r.sampleSize),
+                            h("td", { className: "px-3 py-2 text-right text-cyan-300" }, `${r.maxDeviationPct}%`),
+                            h("td", { className: "px-3 py-2 text-right" }, r.distributionShiftScore),
+                            h("td", { className: "px-3 py-2 text-right font-bold text-emerald-300" }, r.analyticalScore),
+                            h("td", { className: "px-3 py-2 text-slate-300" }, r.statusFlags.join(", ") || r.signalStatus)
+                          )
+                        )
+                      : h("tr", null, h("td", { colSpan: 7, className: "px-3 py-4 text-center font-sans text-slate-400" }, "No scan run yet. Click \"Scan Now\" or enable Simulation Mode."))
+                  )
+                )
+              )
+            ),
+
+            // WALK-FORWARD BACKTESTING
+            h(
+              "section",
+              { className: "terminal-panel p-4" },
+              h(
+                "div",
+                { className: "mb-3 flex flex-wrap items-center justify-between gap-2" },
+                h("div", { className: "flex items-center gap-2" }, h(History, { className: "h-4 w-4 text-cyan-400" }), h("h2", { className: "text-sm font-semibold text-white" }, `Walk-Forward Backtest (${activeSymbol} · ${ticks.length} ticks)`)),
+                h(
+                  "div",
+                  { className: "flex items-center gap-2 text-xs font-mono-tabular" },
+                  h("label", { className: "flex items-center gap-1 rounded border border-slate-800 bg-[#070b16] px-2 py-1" }, h("span", { className: "text-slate-400" }, "Lookback:"), h("input", { type: "number", min: 10, max: 200, value: lookbackTicks, onChange: (e) => setLookbackTicks(Number(e.target.value)), className: "w-12 bg-transparent text-white" })),
+                  h(
+                    "button",
+                    {
+                      type: "button",
+                      disabled: ticks.length < lookbackTicks + 5,
+                      onClick: () =>
+                        setBacktestReport(
+                          runWalkForwardBacktest(ticks, {
+                            symbol: activeSymbol,
+                            mode,
+                            targetDigit,
+                            windowSize,
+                            minLookbackTicks: lookbackTicks,
+                          })
+                        ),
+                      className: "inline-flex items-center gap-1 rounded bg-emerald-500/20 px-3 py-1.5 font-semibold text-emerald-200 ring-1 ring-emerald-500/40 disabled:opacity-40",
+                    },
+                    h(PlayCircle, { className: "h-3.5 w-3.5" }),
+                    "Run Backtest"
+                  )
+                )
+              ),
+              backtestReport
+                ? h(
+                    "div",
+                    { className: "space-y-2" },
+                    h(
+                      "div",
+                      { className: "grid grid-cols-2 gap-2 text-xs font-mono-tabular sm:grid-cols-4" },
+                      h("div", { className: "rounded border border-slate-800 bg-[#070b16] p-2.5" }, h("div", { className: "text-[10px] text-slate-400" }, "Evaluated / Signals"), h("div", { className: "text-sm font-bold text-white" }, `${backtestReport.combined.totalObservations} / ${backtestReport.combined.totalAnalyticalSignals}`)),
+                      h("div", { className: "rounded border border-slate-800 bg-[#070b16] p-2.5" }, h("div", { className: "text-[10px] text-slate-400" }, "Signal Hit Rate"), h("div", { className: "text-sm font-bold text-emerald-300" }, `${(backtestReport.combined.overallSignalHitRate * 100).toFixed(2)}%`)),
+                      h("div", { className: "rounded border border-slate-800 bg-[#070b16] p-2.5" }, h("div", { className: "text-[10px] text-slate-400" }, "Brier / Log Loss"), h("div", { className: "text-sm font-bold text-cyan-300" }, `${backtestReport.combined.brierScore} / ${backtestReport.combined.logLoss}`)),
+                      h("div", { className: "rounded border border-slate-800 bg-[#070b16] p-2.5" }, h("div", { className: "text-[10px] text-slate-400" }, "OOS Hit / Max Miss"), h("div", { className: "text-sm font-bold text-white" }, `${(backtestReport.outOfSample.overallSignalHitRate * 100).toFixed(1)}% / ${backtestReport.combined.maxConsecutiveMisses}`))
+                    ),
+                    h("p", { className: "text-[11px] text-slate-400" }, backtestReport.disclaimer)
+                  )
+                : h("p", { className: "text-xs text-slate-400" }, `Accumulate at least ${lookbackTicks + 5} ticks in ${activeSymbol} (e.g., via Simulation Mode) and click Run Backtest.`)
+            ),
+
+            // DIAGNOSTICS & SETTINGS
+            h(
+              "div",
+              { className: "grid grid-cols-1 gap-4 lg:grid-cols-2" },
+              h(
+                "section",
+                { className: "terminal-panel p-4" },
+                h("div", { className: "mb-2.5 flex items-center gap-2" }, h(Terminal, { className: "h-4 w-4 text-cyan-400" }), h("h2", { className: "text-sm font-semibold text-white" }, "Statistical Tests & Diagnostics")),
+                h(
+                  "div",
+                  { className: "grid grid-cols-2 gap-2 text-xs font-mono-tabular sm:grid-cols-4" },
+                  h("div", { className: "rounded border border-slate-800 bg-[#070b16] p-2" }, h("div", { className: "text-[10px] text-slate-400" }, "Chi² (df=9)"), h("div", { className: "font-semibold text-cyan-300" }, `${statistics.chiSquareStatistic} (p=${statistics.pValue})`)),
+                  h("div", { className: "rounded border border-slate-800 bg-[#070b16] p-2" }, h("div", { className: "text-[10px] text-slate-400" }, "Entropy"), h("div", { className: "font-semibold text-emerald-300" }, `${statistics.shannonEntropyBits}b`)),
+                  h("div", { className: "rounded border border-slate-800 bg-[#070b16] p-2" }, h("div", { className: "text-[10px] text-slate-400" }, "Lag-1 / Lag-2 AC"), h("div", { className: "font-semibold text-slate-200" }, `${statistics.lag1Autocorrelation} / ${statistics.lag2Autocorrelation}`)),
+                  h("div", { className: "rounded border border-slate-800 bg-[#070b16] p-2" }, h("div", { className: "text-[10px] text-slate-400" }, "Serial Dep."), h("div", { className: "font-semibold text-amber-300" }, `${(statistics.serialDependenceScore * 100).toFixed(1)}%`))
+                ),
+                h("p", { className: "mt-2 text-[11px] text-slate-400" }, statistics.multipleTestingWarning),
+                h(
+                  "div",
+                  { className: "mt-2 max-h-28 overflow-y-auto rounded border border-slate-800 bg-[#070b16] p-2 font-mono-tabular text-[11px] space-y-1" },
+                  diagnostics.length > 0
+                    ? diagnostics.slice().reverse().map((ev) => h("div", { key: ev.id, className: ev.level === "error" ? "text-red-300" : ev.level === "warn" ? "text-amber-300" : "text-slate-300" }, `[${ev.code}] ${ev.message}`))
+                    : h("div", { className: "text-slate-500" }, "No diagnostic log entries yet.")
+                )
+              ),
+
+              h(
+                "section",
+                { className: "terminal-panel p-4" },
+                h("div", { className: "mb-2.5 flex items-center gap-2" }, h(SlidersHorizontal, { className: "h-4 w-4 text-cyan-400" }), h("h2", { className: "text-sm font-semibold text-white" }, "Application & Signal Settings")),
+                h(
+                  "div",
+                  { className: "grid grid-cols-1 gap-2.5 text-xs sm:grid-cols-3" },
+                  h(
+                    "label",
+                    { className: "rounded border border-slate-800 bg-[#070b16] p-2" },
+                    h("span", { className: "block text-[10px] uppercase text-slate-400" }, "Endpoint Mode"),
+                    h(
+                      "select",
+                      { value: feedMode, onChange: (e) => setFeedMode(e.target.value), className: "mt-1 w-full bg-transparent text-white" },
+                      h("option", { value: "LIVE_PUBLIC" }, "Primary Public WS"),
+                      h("option", { value: "LEGACY_ADAPTER" }, "Legacy v3 Adapter")
+                    )
+                  ),
+                  h(
+                    "label",
+                    { className: "rounded border border-slate-800 bg-[#070b16] p-2 font-mono-tabular" },
+                    h("span", { className: "block text-[10px] uppercase text-slate-400" }, "App ID"),
+                    h("input", { type: "number", min: 1, value: appId, onChange: (e) => setAppId(Number(e.target.value) || DEFAULT_APP_ID), className: "mt-1 w-full bg-transparent text-white" })
+                  ),
+                  h(
+                    "label",
+                    { className: "rounded border border-slate-800 bg-[#070b16] p-2 font-mono-tabular" },
+                    h("span", { className: "block text-[10px] uppercase text-slate-400" }, `Min Score (${minSignalScore})`),
+                    h("input", { type: "range", min: 40, max: 90, step: 1, value: minSignalScore, onChange: (e) => setMinSignalScore(Number(e.target.value)), className: "mt-1.5 w-full accent-cyan-400" })
+                  )
+                ),
+                h("p", { className: "mt-2.5 text-[11px] text-slate-400" }, "Public market research only. No account passwords, stored tokens, or automated trading.")
+              )
+            )
+          )
+        );
+      }
+
+      createRoot(document.getElementById("root")).render(h(App));
+    </script>
+  </body>
+</html>
