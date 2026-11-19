@@ -1,0 +1,93 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Connect to Deriv</title>
+</head>
+<body>
+    <main>
+        <h1>Deriv OAuth Login</h1>
+        <button id="connect-deriv-btn" type="button">Connect Deriv</button>
+    </main>
+
+    <script>
+        const CLIENT_ID = "YOUR_DERIV_OAUTH_CLIENT_ID";
+
+        // Must exactly match the URL registered with Deriv
+        const REDIRECT_URI = "https://yourwebsite.netlify.app/callback";
+
+        // Request only the permissions your application needs
+        const OAUTH_SCOPE = "trade";
+
+        const PKCE_CHARSET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~";
+
+        // Generate a secure PKCE Code Verifier
+        function generateCodeVerifier(length = 64) {
+            const randomBytes = crypto.getRandomValues(new Uint8Array(length));
+
+            return Array.from(randomBytes)
+                .map(byte => PKCE_CHARSET[byte % PKCE_CHARSET.length])
+                .join("");
+        }
+
+        // Generate an S256 PKCE Code Challenge from the verifier
+        async function generateCodeChallenge(verifier) {
+            const encoder = new TextEncoder();
+            const data = encoder.encode(verifier);
+            const hash = await crypto.subtle.digest("SHA-256", data);
+
+            return btoa(String.fromCharCode(...new Uint8Array(hash)))
+                .replace(/\+/g, "-")
+                .replace(/\//g, "_")
+                .replace(/=+$/, "");
+        }
+
+        // Generate PKCE pair and CSRF state, then persist them for the callback
+        async function generatePKCE() {
+            const verifier = generateCodeVerifier();
+            const challenge = await generateCodeChallenge(verifier);
+
+            const stateBytes = crypto.getRandomValues(new Uint8Array(16));
+            const state = Array.from(stateBytes)
+                .map(b => b.toString(16).padStart(2, "0"))
+                .join("");
+
+            sessionStorage.setItem("pkce_code_verifier", verifier);
+            sessionStorage.setItem("oauth_state", state);
+
+            return {
+                code_verifier: verifier,
+                code_challenge: challenge,
+                code_challenge_method: "S256",
+                state
+            };
+        }
+
+        // Build the Deriv OAuth authorization URL and redirect the user
+        async function connectDeriv() {
+            try {
+                const pkce = await generatePKCE();
+
+                const authURL = new URL("https://auth.deriv.com/oauth2/auth");
+                authURL.searchParams.set("response_type", "code");
+                authURL.searchParams.set("client_id", CLIENT_ID);
+                authURL.searchParams.set("redirect_uri", REDIRECT_URI);
+                authURL.searchParams.set("scope", OAUTH_SCOPE);
+                authURL.searchParams.set("state", pkce.state);
+                authURL.searchParams.set("code_challenge", pkce.code_challenge);
+                authURL.searchParams.set("code_challenge_method", pkce.code_challenge_method);
+
+                window.location.assign(authURL.toString());
+            } catch (error) {
+                console.error("Deriv OAuth error:", error);
+                alert("Unable to connect to Deriv. Please try again.");
+            }
+        }
+
+        document
+            .getElementById("connect-deriv-btn")
+            .addEventListener("click", connectDeriv);
+    </script>
+</body>
+</html>
